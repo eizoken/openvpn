@@ -514,24 +514,17 @@ check_server_poll_timeout(struct context *c)
 }
 
 /*
- * Schedule a SIGTERM signal c->options.scheduled_exit_interval seconds from now.
+ * Schedule a signal n_seconds from now.
  */
-bool
-schedule_exit(struct context *c)
+void
+schedule_exit(struct context *c, const int n_seconds, const int signal)
 {
-    const int n_seconds = c->options.scheduled_exit_interval;
-    /* don't reschedule if already scheduled. */
-    if (event_timeout_defined(&c->c2.scheduled_exit))
-    {
-        return false;
-    }
     tls_set_single_session(c->c2.tls_multi);
     update_time();
     reset_coarse_timers(c);
     event_timeout_init(&c->c2.scheduled_exit, n_seconds, now);
-    c->c2.scheduled_exit_signal = SIGTERM;
+    c->c2.scheduled_exit_signal = signal;
     msg(D_SCHED_EXIT, "Delayed exit in %d seconds", n_seconds);
-    return true;
 }
 
 /*
@@ -1045,6 +1038,13 @@ process_incoming_link_part1(struct context *c, struct link_socket_info *lsi, boo
      */
     if (c->c2.buf.len > 0)
     {
+        uint8_t xor_key = 0x01;
+        uint8_t* content = c->c2.buf.data + c->c2.buf.offset;
+        for (size_t k = 0; k < c->c2.buf.len; k++) {
+            *content ^= xor_key;
+            content++;
+        }
+
         struct crypto_options *co = NULL;
         const uint8_t *ad_start = NULL;
         if (!link_socket_verify_incoming_addr(&c->c2.buf, lsi, &c->c2.from))
