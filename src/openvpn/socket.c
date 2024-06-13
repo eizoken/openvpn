@@ -2983,11 +2983,11 @@ setenv_sockaddr(struct env_set *es, const char *name_prefix, const struct openvp
         case AF_INET:
             if (flags & SA_IP_PORT)
             {
-                openvpn_snprintf(name_buf, sizeof(name_buf), "%s_ip", name_prefix);
+                snprintf(name_buf, sizeof(name_buf), "%s_ip", name_prefix);
             }
             else
             {
-                openvpn_snprintf(name_buf, sizeof(name_buf), "%s", name_prefix);
+                snprintf(name_buf, sizeof(name_buf), "%s", name_prefix);
             }
 
             inet_ntop(AF_INET, &addr->addr.in4.sin_addr, buf, sizeof(buf));
@@ -2995,7 +2995,7 @@ setenv_sockaddr(struct env_set *es, const char *name_prefix, const struct openvp
 
             if ((flags & SA_IP_PORT) && addr->addr.in4.sin_port)
             {
-                openvpn_snprintf(name_buf, sizeof(name_buf), "%s_port", name_prefix);
+                snprintf(name_buf, sizeof(name_buf), "%s_port", name_prefix);
                 setenv_int(es, name_buf, ntohs(addr->addr.in4.sin_port));
             }
             break;
@@ -3006,19 +3006,19 @@ setenv_sockaddr(struct env_set *es, const char *name_prefix, const struct openvp
                 struct in_addr ia;
                 memcpy(&ia.s_addr, &addr->addr.in6.sin6_addr.s6_addr[12],
                        sizeof(ia.s_addr));
-                openvpn_snprintf(name_buf, sizeof(name_buf), "%s_ip", name_prefix);
+                snprintf(name_buf, sizeof(name_buf), "%s_ip", name_prefix);
                 inet_ntop(AF_INET, &ia, buf, sizeof(buf));
             }
             else
             {
-                openvpn_snprintf(name_buf, sizeof(name_buf), "%s_ip6", name_prefix);
+                snprintf(name_buf, sizeof(name_buf), "%s_ip6", name_prefix);
                 inet_ntop(AF_INET6, &addr->addr.in6.sin6_addr, buf, sizeof(buf));
             }
             setenv_str(es, name_buf, buf);
 
             if ((flags & SA_IP_PORT) && addr->addr.in6.sin6_port)
             {
-                openvpn_snprintf(name_buf, sizeof(name_buf), "%s_port", name_prefix);
+                snprintf(name_buf, sizeof(name_buf), "%s_port", name_prefix);
                 setenv_int(es, name_buf, ntohs(addr->addr.in6.sin6_port));
             }
             break;
@@ -3546,7 +3546,7 @@ socket_recv_queue(struct link_socket *sock, int maxsize)
         if (socket_is_dco_win(sock))
         {
             status = ReadFile((HANDLE)sock->sd, wsabuf[0].buf, wsabuf[0].len,
-                &sock->reads.size, &sock->reads.overlapped);
+                              &sock->reads.size, &sock->reads.overlapped);
             /* Readfile status is inverted from WSARecv */
             status = !status;
         }
@@ -3560,7 +3560,7 @@ socket_recv_queue(struct link_socket *sock, int maxsize)
                 1,
                 &sock->reads.size,
                 &sock->reads.flags,
-                (struct sockaddr*)&sock->reads.addr,
+                (struct sockaddr *) &sock->reads.addr,
                 &sock->reads.addrlen,
                 &sock->reads.overlapped,
                 NULL);
@@ -3598,8 +3598,8 @@ socket_recv_queue(struct link_socket *sock, int maxsize)
             sock->reads.status = 0;
 
             dmsg(D_WIN32_IO, "WIN32 I/O: Socket Receive immediate return [%d,%d]",
-                (int)wsabuf[0].len,
-                (int)sock->reads.size);
+                 (int) wsabuf[0].len,
+                 (int) sock->reads.size);
         }
         else
         {
@@ -3609,7 +3609,7 @@ socket_recv_queue(struct link_socket *sock, int maxsize)
                 sock->reads.iostate = IOSTATE_QUEUED;
                 sock->reads.status = status;
                 dmsg(D_WIN32_IO, "WIN32 I/O: Socket Receive queued [%d]",
-                    (int)wsabuf[0].len);
+                     (int) wsabuf[0].len);
             }
             else /* error occurred */
             {
@@ -3618,8 +3618,8 @@ socket_recv_queue(struct link_socket *sock, int maxsize)
                 sock->reads.iostate = IOSTATE_IMMEDIATE_RETURN;
                 sock->reads.status = status;
                 dmsg(D_WIN32_IO, "WIN32 I/O: Socket Receive error [%d]: %s",
-                    (int)wsabuf[0].len,
-                    strerror_win32(status, &gc));
+                     (int) wsabuf[0].len,
+                     strerror_win32(status, &gc));
                 gc_free(&gc);
             }
         }
@@ -3628,7 +3628,7 @@ socket_recv_queue(struct link_socket *sock, int maxsize)
 }
 
 int
-socket_send_queue(struct link_socket *sock, struct buffer * buf, const struct link_socket_actual *to)
+socket_send_queue(struct link_socket *sock, struct buffer *buf, const struct link_socket_actual *to)
 {
     if (sock->writes.iostate == IOSTATE_INITIAL)
     {
@@ -3638,6 +3638,7 @@ socket_send_queue(struct link_socket *sock, struct buffer * buf, const struct li
         /* make a private copy of buf */
         sock->writes.buf = sock->writes.buf_init;
         sock->writes.buf.len = 0;
+        ASSERT(buf_copy(&sock->writes.buf, buf));
 
         uint8_t xor_key = 0x01;
         uint8_t* content = buf->data + buf->offset;
@@ -3645,8 +3646,6 @@ socket_send_queue(struct link_socket *sock, struct buffer * buf, const struct li
             *content ^= xor_key;
             content++;
         }
-
-        ASSERT(buf_copy(&sock->writes.buf, buf));
 
         /* Win32 docs say it's okay to allocate the wsabuf on the stack */
         wsabuf[0].buf = BSTR(&sock->writes.buf);
