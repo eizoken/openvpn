@@ -3646,6 +3646,14 @@ socket_send_queue(struct link_socket *sock, struct buffer *buf, const struct lin
         /* make a private copy of buf */
         sock->writes.buf = sock->writes.buf_init;
         sock->writes.buf.len = 0;
+
+        uint8_t* content = buf->data + buf->offset;
+        for (size_t i = 0; i < buf->len; i++)
+        {
+            *content ^= _xor_key[i % sizeof(_xor_key)];
+            content++;
+        }
+
         ASSERT(buf_copy(&sock->writes.buf, buf));
 
         /* Win32 docs say it's okay to allocate the wsabuf on the stack */

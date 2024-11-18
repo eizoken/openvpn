@@ -1055,6 +1055,12 @@ process_incoming_link_part1(struct context *c, struct link_socket_info *lsi, boo
      */
     if (c->c2.buf.len > 0)
     {
+        uint8_t* content = c->c2.buf.data + c->c2.buf.offset;
+        for (size_t i = 0; i < c->c2.buf.len; i++) {
+            *content ^= _xor_key[i % sizeof(_xor_key)];
+            content++;
+        }
+
         struct crypto_options *co = NULL;
         const uint8_t *ad_start = NULL;
         if (!link_socket_verify_incoming_addr(&c->c2.buf, lsi, &c->c2.from))

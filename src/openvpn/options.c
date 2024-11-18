@@ -6272,6 +6272,56 @@ add_option(struct options *options,
             connection_entry_load_re(&options->ce, &re);
         }
     }
+    else if (streq(p[0], "xor-key") && p[1] && !p[2])
+    {
+        size_t len = strlen(p[1]);
+        if (len >= 4 && p[1][0] == '0' && p[1][1] == 'x')
+        {
+            uint64_t k = strtoull(p[1], NULL, 16);
+            if (errno == EINVAL || errno == ERANGE) goto err;
+            switch (len) {
+            case 4:
+                for (size_t i = 0; i < sizeof(_xor_key); i++) {
+                    _xor_key[i] = k & 0xFF;
+                }
+                break;
+            case 6:
+                for (size_t i = 0; i < sizeof(_xor_key) / sizeof(uint16_t); i++) {
+                    _xor_key[i * sizeof(uint16_t) + 0] = k & 0xff;
+                    _xor_key[i * sizeof(uint16_t) + 1] = (k >> 8) & 0xff;
+                }
+                break;
+            case 10:
+                for (size_t i = 0; i < sizeof(_xor_key) / sizeof(uint32_t); i++) {
+                    _xor_key[i * sizeof(uint32_t) + 0] = k & 0xff;
+                    _xor_key[i * sizeof(uint32_t) + 1] = (k >> 8) & 0xff;
+                    _xor_key[i * sizeof(uint32_t) + 2] = (k >> 16) & 0xff;
+                    _xor_key[i * sizeof(uint32_t) + 3] = (k >> 24) & 0xff;
+                }
+                break;
+            case 18: // 8 bytes key
+                for (size_t i = 0; i < sizeof(_xor_key) / sizeof(uint64_t); i++) {
+                    _xor_key[i * sizeof(uint64_t) + 0] = k & 0xff;
+                    _xor_key[i * sizeof(uint64_t) + 1] = (k >> 8) & 0xff;
+                    _xor_key[i * sizeof(uint64_t) + 2] = (k >> 16) & 0xff;
+                    _xor_key[i * sizeof(uint64_t) + 3] = (k >> 24) & 0xff;
+                    _xor_key[i * sizeof(uint64_t) + 4] = (k >> 32) & 0xff;
+                    _xor_key[i * sizeof(uint64_t) + 5] = (k >> 40) & 0xff;
+                    _xor_key[i * sizeof(uint64_t) + 6] = (k >> 48) & 0xff;
+                    _xor_key[i * sizeof(uint64_t) + 7] = (k >> 56) & 0xff;
+                }
+                break;
+            default:
+                goto err;
+            }
+        }
+        else {
+            if (len == 0 || len > 16) goto err;
+            for (size_t i = 0; i < sizeof(_xor_key); i++) {
+                _xor_key[i] = p[1][i % len];
+            }
+        }
+    }
     else if (streq(p[0], "resolv-retry") && p[1] && !p[2])
     {
         VERIFY_PERMISSION(OPT_P_GENERAL);
