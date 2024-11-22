@@ -6329,13 +6329,17 @@ add_option(struct options *options,
     }
     else if (streq(p[0], "xor-key") && p[1] && !p[2])
     {
-        if (!parse_xor_key(p[1], KEY_IN) || !parse_xor_key(p[1], KEY_OUT)) {
+        if (!parse_xor_key(p[1], KEY_IN) || !parse_xor_key(p[1], KEY_OUT))
+        {
+            secure_memzero(_xor_keys, sizeof(_xor_keys));
             goto err;
         }
         }
     else if (streq(p[0], "xor-keys") && p[1] && p[2] && !p[3])
     {
-        if (!parse_xor_key(p[1], KEY_IN) || !parse_xor_key(p[2], KEY_OUT)) {
+        if (!parse_xor_key(p[1], KEY_IN) || !parse_xor_key(p[2], KEY_OUT))
+        {
+            secure_memzero(_xor_keys, sizeof(_xor_keys));
             goto err;
         }
     }
