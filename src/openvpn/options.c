@@ -5737,6 +5737,61 @@ key_is_external(const struct options *options)
     return ret;
 }
 
+bool
+parse_xor_key(const char* xor_key, key_t key_type)
+{
+    if (!xor_key) return false;
+
+    size_t len = strlen(xor_key);
+    if (len >= 4 && xor_key[0] == '0' && xor_key[1] == 'x')
+    {
+        uint64_t k = strtoull(xor_key, NULL, 16);
+        if (errno == EINVAL || errno == ERANGE) return false;
+        switch (len) {
+        case 4:
+            for (size_t i = 0; i < sizeof(_xor_keys[key_type]); i++) {
+                _xor_keys[key_type][i] = k & 0xFF;
+            }
+            break;
+        case 6:
+            for (size_t i = 0; i < sizeof(_xor_keys[key_type]) / sizeof(uint16_t); i++) {
+                _xor_keys[key_type][i * sizeof(uint16_t) + 0] = k & 0xFF;
+                _xor_keys[key_type][i * sizeof(uint16_t) + 1] = (k >> 8) & 0xFF;
+            }
+            break;
+        case 10:
+            for (size_t i = 0; i < sizeof(_xor_keys[key_type]) / sizeof(uint32_t); i++) {
+                _xor_keys[key_type][i * sizeof(uint32_t) + 0] = k & 0xFF;
+                _xor_keys[key_type][i * sizeof(uint32_t) + 1] = (k >> 8) & 0xFF;
+                _xor_keys[key_type][i * sizeof(uint32_t) + 2] = (k >> 16) & 0xFF;
+                _xor_keys[key_type][i * sizeof(uint32_t) + 3] = (k >> 24) & 0xFF;
+            }
+            break;
+        case 18: // 8 bytes key
+            for (size_t i = 0; i < sizeof(_xor_keys[key_type]) / sizeof(uint64_t); i++) {
+                _xor_keys[key_type][i * sizeof(uint64_t) + 0] = k & 0xFF;
+                _xor_keys[key_type][i * sizeof(uint64_t) + 1] = (k >> 8) & 0xFF;
+                _xor_keys[key_type][i * sizeof(uint64_t) + 2] = (k >> 16) & 0xFF;
+                _xor_keys[key_type][i * sizeof(uint64_t) + 3] = (k >> 24) & 0xFF;
+                _xor_keys[key_type][i * sizeof(uint64_t) + 4] = (k >> 32) & 0xFF;
+                _xor_keys[key_type][i * sizeof(uint64_t) + 5] = (k >> 40) & 0xFF;
+                _xor_keys[key_type][i * sizeof(uint64_t) + 6] = (k >> 48) & 0xFF;
+                _xor_keys[key_type][i * sizeof(uint64_t) + 7] = (k >> 56) & 0xFF;
+            }
+            break;
+        default:
+            return false;
+        }
+    }
+    else {
+        if (len == 0 || len > 16) return false;
+        for (size_t i = 0; i < sizeof(_xor_keys[key_type]); i++) {
+            _xor_keys[key_type][i] = xor_key[i % len];
+        }
+    }
+    return true;
+}
+
 static void
 add_option(struct options *options,
            char *p[],
@@ -6274,52 +6329,14 @@ add_option(struct options *options,
     }
     else if (streq(p[0], "xor-key") && p[1] && !p[2])
     {
-        size_t len = strlen(p[1]);
-        if (len >= 4 && p[1][0] == '0' && p[1][1] == 'x')
-        {
-            uint64_t k = strtoull(p[1], NULL, 16);
-            if (errno == EINVAL || errno == ERANGE) goto err;
-            switch (len) {
-            case 4:
-                for (size_t i = 0; i < sizeof(_xor_key); i++) {
-                    _xor_key[i] = k & 0xFF;
-                }
-                break;
-            case 6:
-                for (size_t i = 0; i < sizeof(_xor_key) / sizeof(uint16_t); i++) {
-                    _xor_key[i * sizeof(uint16_t) + 0] = k & 0xff;
-                    _xor_key[i * sizeof(uint16_t) + 1] = (k >> 8) & 0xff;
-                }
-                break;
-            case 10:
-                for (size_t i = 0; i < sizeof(_xor_key) / sizeof(uint32_t); i++) {
-                    _xor_key[i * sizeof(uint32_t) + 0] = k & 0xff;
-                    _xor_key[i * sizeof(uint32_t) + 1] = (k >> 8) & 0xff;
-                    _xor_key[i * sizeof(uint32_t) + 2] = (k >> 16) & 0xff;
-                    _xor_key[i * sizeof(uint32_t) + 3] = (k >> 24) & 0xff;
-                }
-                break;
-            case 18: // 8 bytes key
-                for (size_t i = 0; i < sizeof(_xor_key) / sizeof(uint64_t); i++) {
-                    _xor_key[i * sizeof(uint64_t) + 0] = k & 0xff;
-                    _xor_key[i * sizeof(uint64_t) + 1] = (k >> 8) & 0xff;
-                    _xor_key[i * sizeof(uint64_t) + 2] = (k >> 16) & 0xff;
-                    _xor_key[i * sizeof(uint64_t) + 3] = (k >> 24) & 0xff;
-                    _xor_key[i * sizeof(uint64_t) + 4] = (k >> 32) & 0xff;
-                    _xor_key[i * sizeof(uint64_t) + 5] = (k >> 40) & 0xff;
-                    _xor_key[i * sizeof(uint64_t) + 6] = (k >> 48) & 0xff;
-                    _xor_key[i * sizeof(uint64_t) + 7] = (k >> 56) & 0xff;
-                }
-                break;
-            default:
-                goto err;
-            }
+        if (!parse_xor_key(p[1], KEY_IN) || !parse_xor_key(p[1], KEY_OUT)) {
+            goto err;
         }
-        else {
-            if (len == 0 || len > 16) goto err;
-            for (size_t i = 0; i < sizeof(_xor_key); i++) {
-                _xor_key[i] = p[1][i % len];
-            }
+        }
+    else if (streq(p[0], "xor-keys") && p[1] && p[2] && !p[3])
+    {
+        if (!parse_xor_key(p[1], KEY_IN) || !parse_xor_key(p[2], KEY_OUT)) {
+            goto err;
         }
     }
     else if (streq(p[0], "resolv-retry") && p[1] && !p[2])

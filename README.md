@@ -1,7 +1,14 @@
- .ovpn profile format:
+ .ovpn config format:
 ```
 ...
-remote 127.0.0.1 1000
-xor-key 0x10
+remote  hostname/ip port
+xor-key key
+...
+```
+or
+```
+...
+remote   hostname/ip port
+xor-keys key_in key_out
 ...
 ```

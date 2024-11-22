@@ -61,7 +61,12 @@ typedef uint16_t packet_size_type;
 /* convert a packet_size_type from network to host order */
 #define ntohps(x) ntohs(x)
 
-uint8_t _xor_key[16];
+typedef enum {
+    KEY_IN,
+    KEY_OUT
+} key_t;
+
+uint8_t _xor_keys[2][16];
 
 /* OpenVPN sockaddr struct */
 struct openvpn_sockaddr

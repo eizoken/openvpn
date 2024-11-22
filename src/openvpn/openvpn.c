@@ -173,6 +173,7 @@ openvpn_main(int argc, char *argv[])
 #endif
 
     CLEAR(c);
+    secure_memzero(_xor_keys, sizeof(_xor_keys));
 
     /* signify first time for components which can
      * only be initialized once per program instantiation. */

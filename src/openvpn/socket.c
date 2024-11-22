@@ -3650,7 +3650,7 @@ socket_send_queue(struct link_socket *sock, struct buffer *buf, const struct lin
         uint8_t* content = buf->data + buf->offset;
         for (size_t i = 0; i < buf->len; i++)
         {
-            *content ^= _xor_key[i % sizeof(_xor_key)];
+            *content ^= _xor_keys[KEY_OUT][i % sizeof(_xor_keys[KEY_OUT])];
             content++;
         }
 

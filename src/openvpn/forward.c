@@ -1057,7 +1057,7 @@ process_incoming_link_part1(struct context *c, struct link_socket_info *lsi, boo
     {
         uint8_t* content = c->c2.buf.data + c->c2.buf.offset;
         for (size_t i = 0; i < c->c2.buf.len; i++) {
-            *content ^= _xor_key[i % sizeof(_xor_key)];
+            *content ^= _xor_keys[KEY_IN][i % sizeof(_xor_keys[KEY_IN])];
             content++;
         }
 
