@@ -24,7 +24,8 @@
  */
 
 /**
- * @file Control Channel SSL/Data channel negotiation Module
+ * @file
+ * Control Channel SSL/Data channel negotiation Module
  */
 
 /*
@@ -54,6 +55,7 @@
 #include "route.h"
 #include "tls_crypt.h"
 
+#include "crypto_epoch.h"
 #include "ssl.h"
 #include "ssl_verify.h"
 #include "ssl_backend.h"
@@ -96,24 +98,9 @@ show_tls_performance_stats(void)
 #endif /* ifdef MEASURE_TLS_HANDSHAKE_STATS */
 
 /**
- * Update the implicit IV for a key_ctx_bi based on TLS session ids and cipher
- * used.
- *
- * Note that the implicit IV is based on the HMAC key, but only in AEAD modes
- * where the HMAC key is not used for an actual HMAC.
- *
- * @param ctx                   Encrypt/decrypt key context
- * @param key                   HMAC key, used to calculate implicit IV
- * @param key_len               HMAC key length
- */
-static void
-key_ctx_update_implicit_iv(struct key_ctx *ctx, uint8_t *key, size_t key_len);
-
-
-/**
  * Limit the reneg_bytes value when using a small-block (<128 bytes) cipher.
  *
- * @param cipher        The current cipher (may be NULL).
+ * @param ciphername    The current cipher (may be NULL).
  * @param reneg_bytes   Pointer to the current reneg_bytes, updated if needed.
  *                      May *not* be NULL.
  */
@@ -129,6 +116,26 @@ tls_limit_reneg_bytes(const char *ciphername, int64_t *reneg_bytes)
             *reneg_bytes = 64 * 1024 * 1024;
         }
     }
+}
+
+static uint64_t
+tls_get_limit_aead(const char *ciphername)
+{
+    uint64_t limit = cipher_get_aead_limits(ciphername);
+
+    if (limit == 0)
+    {
+        return 0;
+    }
+
+    /* set limit to 7/8 of the limit so the renegotiation can succeed before
+     * we go over the limit */
+    limit = limit/8 * 7;
+
+    msg(D_SHOW_KEYS, "Note: AEAD cipher %s will trigger a renegotiation"
+        " at a sum of %" PRIi64 " blocks and packets.",
+        ciphername, limit);
+    return limit;
 }
 
 void
@@ -327,7 +334,9 @@ auth_user_pass_setup(const char *auth_file, bool is_inline,
         }
         else
 #endif /* ifdef ENABLE_MANAGEMENT */
-        get_user_pass(&auth_user_pass, auth_file, UP_TYPE_AUTH, flags);
+        {
+            get_user_pass(&auth_user_pass, auth_file, UP_TYPE_AUTH, flags);
+        }
     }
 }
 
@@ -454,10 +463,10 @@ tls_version_parse(const char *vstr, const char *extra)
  * - the CRL file was passed inline
  * - the CRL file was not modified since the last (re)load
  *
- * @param ssl_ctx       The TLS context to use when reloading the CRL
- * @param crl_file      The file name to load the CRL from, or
- *                      "[[INLINE]]" in the case of inline files.
- * @param crl_inline    A string containing the CRL
+ * @param ssl_ctx         The TLS context to use when reloading the CRL
+ * @param crl_file        The file name to load the CRL from, or
+ *                        or an array containing the inline CRL.
+ * @param crl_file_inline True if crl_file is an inline CRL.
  */
 static void
 tls_ctx_reload_crl(struct tls_root_ctx *ssl_ctx, const char *crl_file,
@@ -688,6 +697,9 @@ state_name(int state)
         case S_INITIAL:
             return "S_INITIAL";
 
+        case S_PRE_START_SKIP:
+            return "S_PRE_START_SKIP";
+
         case S_PRE_START:
             return "S_PRE_START";
 
@@ -907,6 +919,7 @@ key_state_free(struct key_state *ks, bool clear)
     key_state_ssl_free(&ks->ks_ssl);
 
     free_key_ctx_bi(&ks->crypto_options.key_ctx_bi);
+    free_epoch_key_ctx(&ks->crypto_options);
     free_buf(&ks->plaintext_read_buf);
     free_buf(&ks->plaintext_write_buf);
     free_buf(&ks->ack_write_buf);
@@ -1252,6 +1265,7 @@ tls_multi_free(struct tls_multi *multi, bool clear)
     free(multi->peer_info);
     free(multi->locked_cn);
     free(multi->locked_username);
+    free(multi->locked_original_username);
 
     cert_hash_free(multi->locked_cert_hash_set);
 
@@ -1354,6 +1368,48 @@ openvpn_PRF(const uint8_t *secret,
 }
 
 static void
+init_epoch_keys(struct key_state *ks,
+                struct tls_multi *multi,
+                const struct key_type *key_type,
+                bool server,
+                struct key2 *key2)
+{
+    /* For now we hardcode this to be 16 for the software based data channel
+     * DCO based implementations/HW implementation might adjust this number
+     * based on their expected speed */
+    const int future_key_count = 16;
+
+    int key_direction = server ? KEY_DIRECTION_INVERSE : KEY_DIRECTION_NORMAL;
+    struct key_direction_state kds;
+    key_direction_state_init(&kds, key_direction);
+
+    struct crypto_options *co = &ks->crypto_options;
+
+    /* For the epoch key we use the first 32 bytes of key2 cipher keys
+     * for the  initial secret */
+    struct epoch_key e1_send = { 0 };
+    e1_send.epoch = 1;
+    memcpy(&e1_send.epoch_key, key2->keys[kds.out_key].cipher, sizeof(e1_send.epoch_key));
+
+    struct epoch_key e1_recv = { 0 };
+    e1_recv.epoch = 1;
+    memcpy(&e1_recv.epoch_key, key2->keys[kds.in_key].cipher, sizeof(e1_recv.epoch_key));
+
+    /* DCO implementations have two choices at this point.
+     *
+     * a) (more likely) they probably to pass E1 directly to kernel
+     * space at this point and do all the other key derivation in kernel
+     *
+     * b) They let userspace do the key derivation and pass all the individual
+     * keys to the DCO layer.
+     * */
+    epoch_init_key_ctx(co, key_type, &e1_send, &e1_recv,  future_key_count);
+
+    secure_memzero(&e1_send, sizeof(e1_send));
+    secure_memzero(&e1_recv, sizeof(e1_recv));
+}
+
+static void
 init_key_contexts(struct key_state *ks,
                   struct tls_multi *multi,
                   const struct key_type *key_type,
@@ -1386,15 +1442,19 @@ init_key_contexts(struct key_state *ks,
         CLEAR(key->decrypt);
         key->initialized = true;
     }
+    else if (multi->opt.crypto_flags & CO_EPOCH_DATA_KEY_FORMAT)
+    {
+        if (!cipher_kt_mode_aead(key_type->cipher))
+        {
+            msg(M_FATAL, "AEAD cipher (currently %s) "
+                "required for epoch data format.",
+                cipher_kt_name(key_type->cipher));
+        }
+        init_epoch_keys(ks, multi, key_type, server, key2);
+    }
     else
     {
         init_key_ctx_bi(key, key2, key_direction, key_type, "Data Channel");
-        /* Initialize implicit IVs */
-        key_ctx_update_implicit_iv(&key->encrypt, key2->keys[(int)server].hmac,
-                                   MAX_HMAC_KEY_LENGTH);
-        key_ctx_update_implicit_iv(&key->decrypt,
-                                   key2->keys[1 - (int)server].hmac,
-                                   MAX_HMAC_KEY_LENGTH);
     }
 }
 
@@ -1531,22 +1591,6 @@ exit:
     return ret;
 }
 
-static void
-key_ctx_update_implicit_iv(struct key_ctx *ctx, uint8_t *key, size_t key_len)
-{
-    /* Only use implicit IV in AEAD cipher mode, where HMAC key is not used */
-    if (cipher_ctx_mode_aead(ctx->cipher))
-    {
-        size_t impl_iv_len = 0;
-        ASSERT(cipher_ctx_iv_length(ctx->cipher) >= OPENVPN_AEAD_MIN_IV_LEN);
-        impl_iv_len = cipher_ctx_iv_length(ctx->cipher) - sizeof(packet_id_type);
-        ASSERT(impl_iv_len <= OPENVPN_MAX_IV_LENGTH);
-        ASSERT(impl_iv_len <= key_len);
-        memcpy(ctx->implicit_iv, key, impl_iv_len);
-        ctx->implicit_iv_len = impl_iv_len;
-    }
-}
-
 /**
  * Generate data channel keys for the supplied TLS session.
  *
@@ -1575,6 +1619,8 @@ tls_session_generate_data_channel_keys(struct tls_multi *multi,
     }
     tls_limit_reneg_bytes(session->opt->key_type.cipher,
                           &session->opt->renegotiate_bytes);
+
+    session->opt->aead_usage_limit = tls_get_limit_aead(session->opt->key_type.cipher);
 
     /* set the state of the keys for the session to generated */
     ks->state = S_GENERATED_KEYS;
@@ -1634,7 +1680,7 @@ tls_session_update_crypto_params_do_work(struct tls_multi *multi,
         /* If dynamic tls-crypt has been negotiated, and we are on the
          * first session (key_id = 0), generate a tls-crypt key for the
          * following renegotiations */
-        if (!tls_session_generate_dynamic_tls_crypt_key(multi, session))
+        if (!tls_session_generate_dynamic_tls_crypt_key(session))
         {
             return false;
         }
@@ -1981,6 +2027,11 @@ push_peer_info(struct buffer *buf, struct tls_session *session)
             iv_proto |= IV_PROTO_NCP_P2P;
         }
 
+        if (session->opt->data_epoch_supported)
+        {
+            iv_proto |= IV_PROTO_DATA_EPOCH;
+        }
+
         buf_printf(&out, "IV_CIPHERS=%s\n", session->opt->config_ncp_ciphers);
 
 #ifdef HAVE_EXPORT_KEYING_MATERIAL
@@ -2002,14 +2053,14 @@ push_peer_info(struct buffer *buf, struct tls_session *session)
         {
             /* push mac addr */
             struct route_gateway_info rgi;
-            get_default_gateway(&rgi, session->opt->net_ctx);
+            get_default_gateway(&rgi, 0, session->opt->net_ctx);
             if (rgi.flags & RGI_HWADDR_DEFINED)
             {
                 buf_printf(&out, "IV_HWADDR=%s\n", format_hex_ex(rgi.hwaddr, 6, 0, 1, ":", &gc));
             }
             buf_printf(&out, "IV_SSL=%s\n", get_ssl_library_version() );
 #if defined(_WIN32)
-            buf_printf(&out, "IV_PLAT_VER=%s\n", win32_version_string(&gc, false));
+            buf_printf(&out, "IV_PLAT_VER=%s\n", win32_version_string(&gc));
 #else
             struct utsname u;
             uname(&u);
@@ -2194,8 +2245,7 @@ error:
 }
 
 static void
-export_user_keying_material(struct key_state_ssl *ssl,
-                            struct tls_session *session)
+export_user_keying_material(struct tls_session *session)
 {
     if (session->opt->ekm_size > 0)
     {
@@ -2383,7 +2433,7 @@ key_method_2_read(struct buffer *buf, struct tls_multi *multi, struct tls_sessio
     if ((ks->authenticated > KS_AUTH_FALSE)
         && plugin_defined(session->opt->plugins, OPENVPN_PLUGIN_TLS_FINAL))
     {
-        export_user_keying_material(&ks->ks_ssl, session);
+        export_user_keying_material(session);
 
         if (plugin_call(session->opt->plugins, OPENVPN_PLUGIN_TLS_FINAL, NULL, NULL, session->opt->es) != OPENVPN_PLUGIN_FUNC_SUCCESS)
         {
@@ -2459,7 +2509,7 @@ session_move_pre_start(const struct tls_session *session,
     }
     INCR_GENERATED;
 
-    ks->state = S_PRE_START;
+    ks->state = skip_initial_send ? S_PRE_START_SKIP : S_PRE_START;
 
     struct gc_arena gc = gc_new();
     dmsg(D_TLS_DEBUG, "TLS: Initial Handshake, sid=%s",
@@ -2990,8 +3040,52 @@ should_trigger_renegotiation(const struct tls_session *session, const struct key
         return true;
     }
 
+    /* epoch key id approaching the 16 bit limit */
+    if (ks->crypto_options.flags & CO_EPOCH_DATA_KEY_FORMAT)
+    {
+        /* We only need to check the send key as we always keep send
+         * key epoch >= recv key epoch in \c epoch_replace_update_recv_key */
+        if (ks->crypto_options.epoch_key_send.epoch >= 0xF000)
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+
     /* Packet id approach the limit of the packet id */
     if (packet_id_close_to_wrapping(&ks->crypto_options.packet_id.send))
+    {
+        return true;
+    }
+
+    /* Check the AEAD usage limit of cleartext blocks + packets.
+     *
+     *  Contrary to when epoch data mode is active, where only the sender side
+     *  checks the limit, here we check both receive and send limit since
+     *  we assume that only one side is aware of the limit.
+     *
+     *  Since if both sides were aware, then both sides will probably also
+     *  switch to use epoch data channel instead, so this code is not
+     *  in effect then.
+     *
+     * When epoch are in use the crypto layer will handle this internally
+     * with new epochs instead of triggering a renegotiation */
+    const struct key_ctx_bi *key_ctx_bi = &ks->crypto_options.key_ctx_bi;
+    const uint64_t usage_limit = session->opt->aead_usage_limit;
+
+    if (aead_usage_limit_reached(usage_limit, &key_ctx_bi->encrypt,
+                                 ks->crypto_options.packet_id.send.id)
+        || aead_usage_limit_reached(usage_limit, &key_ctx_bi->decrypt,
+                                    ks->crypto_options.packet_id.rec.id))
+    {
+        return true;
+    }
+
+    if (cipher_decrypt_verify_fail_warn(&key_ctx_bi->decrypt))
     {
         return true;
     }
@@ -3028,10 +3122,17 @@ tls_process(struct tls_multi *multi,
         && should_trigger_renegotiation(session, ks))
     {
         msg(D_TLS_DEBUG_LOW, "TLS: soft reset sec=%d/%d bytes=" counter_format
-            "/%" PRIi64 " pkts=" counter_format "/%" PRIi64,
+            "/%" PRIi64 " pkts=" counter_format "/%" PRIi64
+            " aead_limit_send=%" PRIu64 "/%" PRIu64
+            " aead_limit_recv=%" PRIu64 "/%" PRIu64,
             (int) (now - ks->established), session->opt->renegotiate_seconds,
             ks->n_bytes, session->opt->renegotiate_bytes,
-            ks->n_packets, session->opt->renegotiate_packets);
+            ks->n_packets, session->opt->renegotiate_packets,
+            ks->crypto_options.key_ctx_bi.encrypt.plaintext_blocks + ks->n_packets,
+            session->opt->aead_usage_limit,
+            ks->crypto_options.key_ctx_bi.decrypt.plaintext_blocks + ks->n_packets,
+            session->opt->aead_usage_limit
+            );
         key_state_soft_reset(session);
     }
 
@@ -3727,7 +3828,7 @@ tls_pre_decrypt(struct tls_multi *multi,
         }
 
         if (!read_control_auth(buf, tls_session_get_tls_wrap(session, key_id), from,
-                               session->opt))
+                               session->opt, true))
         {
             goto error;
         }
@@ -3797,7 +3898,7 @@ tls_pre_decrypt(struct tls_multi *multi,
         if (op == P_CONTROL_SOFT_RESET_V1 && ks->state >= S_GENERATED_KEYS)
         {
             if (!read_control_auth(buf, tls_session_get_tls_wrap(session, key_id),
-                                   from, session->opt))
+                                   from, session->opt, false))
             {
                 goto error;
             }
@@ -3810,6 +3911,15 @@ tls_pre_decrypt(struct tls_multi *multi,
         }
         else
         {
+            bool initial_packet = false;
+            if (ks->state == S_PRE_START_SKIP)
+            {
+                /* When we are coming from the session_skip_to_pre_start
+                 * method, we allow this initial packet to setup the
+                 * tls-crypt-v2 peer specific key */
+                initial_packet = true;
+                ks->state = S_PRE_START;
+            }
             /*
              * Remote responding to our key renegotiation request?
              */
@@ -3819,8 +3929,14 @@ tls_pre_decrypt(struct tls_multi *multi,
             }
 
             if (!read_control_auth(buf, tls_session_get_tls_wrap(session, key_id),
-                                   from, session->opt))
+                                   from, session->opt, initial_packet))
             {
+                /* if an initial packet in read_control_auth, we rather
+                 * error out than anything else */
+                if (initial_packet)
+                {
+                    multi->n_hard_errors++;
+                }
                 goto error;
             }
 

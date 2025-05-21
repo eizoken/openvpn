@@ -50,6 +50,7 @@
 #include "openvpn.h"
 #include "occ.h"
 #include "ping.h"
+#include "multi_io.h"
 
 #define IOW_TO_TUN          (1<<0)
 #define IOW_TO_LINK         (1<<1)
@@ -67,6 +68,10 @@
 extern counter_type link_read_bytes_global;
 
 extern counter_type link_write_bytes_global;
+
+void get_io_flags_dowork_udp(struct context *c, struct multi_io *multi_io, const unsigned int flags);
+
+void get_io_flags_udp(struct context *c, struct multi_io *multi_io, const unsigned int flags);
 
 void io_wait_dowork(struct context *c, const unsigned int flags);
 
@@ -86,11 +91,11 @@ void process_io(struct context *c, struct link_socket *sock);
  * - Check that the client authentication has succeeded; if not, drop the
  *   packet.
  * - If the \a comp_frag argument is true:
- *   - Call \c lzo_compress() of the \link Data Channel Compression
+ *   - Call \c lzo_compress() of the \link compression Data Channel Compression
  *     module\endlink to (possibly) compress the packet.
- *   - Call \c fragment_outgoing() of the \link Data Channel Fragmentation
+ *   - Call \c fragment_outgoing() of the \link fragmentation Data Channel Fragmentation
  *     module\endlink to (possibly) fragment the packet.
- * - Activate the \link Data Channel Crypto module\endlink to perform
+ * - Activate the \link data_crypto Data Channel Crypto module\endlink to perform
  *   security operations on the packet.
  *   - Call \c tls_pre_encrypt() to choose the appropriate security
  *     parameters for this packet.
@@ -231,10 +236,12 @@ void read_incoming_tun(struct context *c);
  *
  * If an error occurs, it is logged and the packet is dropped.
  *
- * @param c - The context structure of the VPN tunnel associated with the
- *     packet.
+ * @param c       The context structure of the VPN tunnel associated with
+ *                the packet.
+ * @param out_sock  Socket that will be used to send out the packet.
+ *
  */
-void process_incoming_tun(struct context *c);
+void process_incoming_tun(struct context *c, struct link_socket *out_sock);
 
 
 /**
@@ -246,10 +253,11 @@ void process_incoming_tun(struct context *c);
  *
  * If an error occurs, it is logged and the packet is dropped.
  *
- * @param c - The context structure of the VPN tunnel associated with
- *     the packet.
+ * @param c      The context structure of the VPN tunnel associated
+ *               with the packet.
+ * @param in_sock  Socket where the packet was received.
  */
-void process_outgoing_tun(struct context *c);
+void process_outgoing_tun(struct context *c, struct link_socket *in_sock);
 
 
 /**************************************************************************/
@@ -304,20 +312,21 @@ void reschedule_multi_process(struct context *c);
 #define PIPV6_ICMP_NOHOST_SERVER        (1<<6)
 
 
-void process_ip_header(struct context *c, unsigned int flags, struct buffer *buf);
+void process_ip_header(struct context *c, unsigned int flags, struct buffer *buf,
+                       struct link_socket *sock);
 
 bool schedule_exit(struct context *c);
 
 static inline struct link_socket_info *
 get_link_socket_info(struct context *c)
 {
-    if (c->c2.link_socket_info)
+    if (c->c2.link_socket_infos)
     {
-        return c->c2.link_socket_info;
+        return c->c2.link_socket_infos[0];
     }
     else
     {
-        return &c->c2.link_socket->info;
+        return &c->c2.link_sockets[0]->info;
     }
 }
 
@@ -351,23 +360,18 @@ p2p_iow_flags(const struct context *c)
     {
         flags |= IOW_TO_TUN;
     }
-#ifdef _WIN32
-    if (tuntap_ring_empty(c->c1.tuntap))
-    {
-        flags &= ~IOW_READ_TUN;
-    }
-#endif
     return flags;
 }
 
 /*
  * This is the core I/O wait function, used for all I/O waits except
- * for TCP in server mode.
+ * for the top-level server sockets.
  */
 static inline void
 io_wait(struct context *c, const unsigned int flags)
 {
-    if (c->c2.fast_io && (flags & (IOW_TO_TUN|IOW_TO_LINK|IOW_MBUF)))
+    if (proto_is_dgram(c->c2.link_sockets[0]->info.proto)
+        && c->c2.fast_io && (flags & (IOW_TO_TUN|IOW_TO_LINK|IOW_MBUF)))
     {
         /* fast path -- only for TUN/TAP/UDP writes */
         unsigned int ret = 0;
@@ -383,36 +387,8 @@ io_wait(struct context *c, const unsigned int flags)
     }
     else
     {
-#ifdef _WIN32
-        bool skip_iowait = flags & IOW_TO_TUN;
-        if (flags & IOW_READ_TUN)
-        {
-            /*
-             * don't read from tun if we have pending write to link,
-             * since every tun read overwrites to_link buffer filled
-             * by previous tun read
-             */
-            skip_iowait = !(flags & IOW_TO_LINK);
-        }
-        if (tuntap_is_wintun(c->c1.tuntap) && skip_iowait)
-        {
-            unsigned int ret = 0;
-            if (flags & IOW_TO_TUN)
-            {
-                ret |= TUN_WRITE;
-            }
-            if (flags & IOW_READ_TUN)
-            {
-                ret |= TUN_READ;
-            }
-            c->c2.event_set_status = ret;
-        }
-        else
-#endif /* ifdef _WIN32 */
-        {
-            /* slow path */
-            io_wait_dowork(c, flags);
-        }
+        /* slow path */
+        io_wait_dowork(c, flags);
     }
 }
 

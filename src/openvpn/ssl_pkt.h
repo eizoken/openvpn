@@ -22,9 +22,10 @@
  */
 
 /**
- * @file SSL control channel wrap/unwrap and decode functions. This file
- *        (and its .c file) is designed to to be included in units/etc without
- *        pulling in a lot of dependencies
+ * @file
+ * SSL control channel wrap/unwrap and decode functions.
+ * This file (and its .c file) is designed to to be included in units/etc without
+ * pulling in a lot of dependencies.
  */
 
 #ifndef SSL_PKT_H
@@ -108,10 +109,6 @@ struct tls_pre_decrypt_state {
     struct session_id server_session_id;
 };
 
-/**
- *
- * @param state
- */
 void free_tls_pre_decrypt_state(struct tls_pre_decrypt_state *state);
 
 /**
@@ -136,10 +133,11 @@ void free_tls_pre_decrypt_state(struct tls_pre_decrypt_state *state);
  *
  * This function is only used in the UDP p2mp server code path
  *
- * @param tas - The standalone TLS authentication setting structure for
+ * @param[in] tas    The standalone TLS authentication setting structure for
  *     this process.
- * @param from - The source address of the packet.
- * @param buf - A buffer structure containing the incoming packet.
+ * @param[out] state The state struct to store information in.
+ * @param[in] from   The source address of the packet.
+ * @param[in] buf    buffer structure containing the incoming packet.
  *
  * @return
  * @li True if the packet is valid and a new VPN tunnel should be created
@@ -182,7 +180,7 @@ calculate_session_id_hmac(struct session_id client_sid,
 /**
  * Checks if a control packet has a correct HMAC server session id
  *
- * @param client_sid    session id of the client
+ * @param state         session information
  * @param from          link_socket from the client
  * @param hmac          the hmac context to use for the calculation
  * @param handwindow    the quantisation of the current time
@@ -207,14 +205,22 @@ write_control_auth(struct tls_session *session,
                    bool prepend_ack);
 
 
-/*
+
+/**
  * Read a control channel authentication record.
+ * @param buf               buffer that holds the incoming packet
+ * @param ctx               control channel security context
+ * @param from              incoming link socket address
+ * @param opt               tls options struct for the session
+ * @param initial_packet    whether this is the initial packet for the connection
+ * @return                  if the packet was successfully processed
  */
 bool
 read_control_auth(struct buffer *buf,
                   struct tls_wrap_ctx *ctx,
                   const struct link_socket_actual *from,
-                  const struct tls_options *opt);
+                  const struct tls_options *opt,
+                  bool initial_packet);
 
 
 /**

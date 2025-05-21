@@ -89,6 +89,12 @@ fast hardware. SSL/TLS authentication must be used in this mode.
   will lead to authentication bypass (as does returning success on a wrong
   password from a script).
 
+  **Note:** the username for ``--auth-gen-token`` can be overridden by
+  ``--override-user``. In this case the client will be pushed also the
+  ``--auth-token-user`` option and an auth token that is valid for that
+  username instead of the original username that the client authenticated
+  with.
+
 --auth-gen-token-secret file
   Specifies a file that holds a secret for the HMAC used in
   ``--auth-gen-token`` If ``file`` is not present OpenVPN will generate a
@@ -412,6 +418,41 @@ fast hardware. SSL/TLS authentication must be used in this mode.
 
   This option requires that ``--disable-occ`` NOT be used.
 
+--override-username username
+  Sets the username of a connection to the specified username.  This username
+  will also be used by ``--auth-gen-token``. However, the overridden
+  username comes only into effect *after* the ``--client-config-dir`` has been
+  read and the ``--auth-user-pass-verify`` and ``--client-connect`` scripts
+  have been run.
+
+  Also ``--username-as-common-name`` will use the client provided username
+  as common-name. It is recommended to avoid the use of the
+  ``--override-username`` option if the option ``--username-as-common-name``
+  is being used.
+
+  The changed username will be picked up by the status output and also by
+  the ``--auth-gen-token`` option. It will also be pushed to the client
+  using ``--auth-token-user`` if ``--auth-gen-token`` is enabled.
+
+  Internally on all subsequent renegotiations the client provided username
+  will be replaced by the username provided by ``--override-username``.
+  If the client changes to a username that is different from both the initial
+  and the overridden username, the client will be rejected.
+
+  Special care should be taken that both the initial username of the client
+  and the overridden username are handled correctly when using
+  ``--override-username`` and the related options to avoid
+  authentication/authorisation bypasses.
+
+  This option is mainly intended for use cases that use certificates and
+  multi factor authentication and therefore do not provide a username that
+  can be used for ``--auth-gen-token`` to allow providing a username in
+  these scenarios.
+
+  If the ``--auth-token`` directive is pushed by another script/plugin or
+  management interface, consider also generating and pushing
+  ``--auth-token-user``.
+
 --port-share args
   Share OpenVPN TCP with another service
 
@@ -429,7 +470,7 @@ fast hardware. SSL/TLS authentication must be used in this mode.
 
   ``dir`` specifies an optional directory where a temporary file with name
   N containing content C will be dynamically generated for each proxy
-  connection, where N is the source IP:port of the client connection and C
+  connection, where C is the source IP:port of the client connection and N
   is the source IP:port of the connection to the proxy receiver. This
   directory can be used as a dictionary by the proxy receiver to determine
   the origin of the connection. Each generated file will be automatically

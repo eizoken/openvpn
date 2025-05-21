@@ -23,7 +23,8 @@
  */
 
 /**
- * @file OpenSSL compatibility stub
+ * @file
+ * OpenSSL compatibility stub
  *
  * This file provide compatibility stubs for the OpenSSL libraries
  * prior to version 1.1. This version introduces many changes in the
@@ -75,7 +76,7 @@ X509_OBJECT_free(X509_OBJECT *obj)
 #define RSA_F_RSA_OSSL_PRIVATE_ENCRYPT       RSA_F_RSA_EAY_PRIVATE_ENCRYPT
 #endif
 
-#if defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x3050400fL
+#if defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x3050400fL || defined(OPENSSL_IS_AWSLC)
 #define SSL_get_peer_tmp_key SSL_get_server_tmp_key
 #endif
 
@@ -171,5 +172,38 @@ ERR_get_error_all(const char **file, int *line,
 }
 
 #endif /* OPENSSL_VERSION_NUMBER < 0x30000000L */
+
+#if OPENSSL_VERSION_NUMBER < 0x30500000 && (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER > 0x3050400fL)
+static inline int
+SSL_get0_peer_signature_name(SSL *ssl, const char **sigalg)
+{
+    int peer_sig_nid;
+    if (SSL_get_peer_signature_nid(ssl, &peer_sig_nid)
+        && peer_sig_nid != NID_undef)
+    {
+        *sigalg = OBJ_nid2sn(peer_sig_nid);
+        return 1;
+    }
+    return 0;
+}
+#elif defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER <= 0x3050400fL
+/* The older LibreSSL version do not implement any variant of getting the peer
+ * signature */
+static inline int
+SSL_get0_peer_signature_name(const SSL *ssl, const char **sigalg)
+{
+    *sigalg = NULL;
+    return 0;
+}
+#endif /* if OPENSSL_VERSION_NUMBER < 0x30500000 && (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER > 0x3050400fL) */
+
+#if OPENSSL_VERSION_NUMBER < 0x30200000L && OPENSSL_VERSION_NUMBER >= 0x30000000L
+static inline const char *
+SSL_get0_group_name(SSL *s)
+{
+    int nid = SSL_get_negotiated_group(s);
+    return SSL_group_to_name(s, nid);
+}
+#endif
 
 #endif /* OPENSSL_COMPAT_H_ */

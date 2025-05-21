@@ -23,7 +23,8 @@
  */
 
 /**
- * @file Control Channel SSL library backend module
+ * @file
+ * Control Channel SSL library backend module
  */
 
 
@@ -240,6 +241,8 @@ void tls_ctx_load_ecdh_params(struct tls_root_ctx *ctx, const char *curve_name
  *                              a string containing the information in the case
  *                              of inline files.
  * @param pkcs12_file_inline    True if pkcs12_file is an inline file.
+ * @param load_ca_file          True if CAs from the file should be added to
+ *                              the cert store and be trusted.
  *
  * @return                      1 if an error occurred, 0 if parsing was
  *                              successful.
@@ -252,7 +255,7 @@ int tls_ctx_load_pkcs12(struct tls_root_ctx *ctx, const char *pkcs12_file,
  * context.
  *
  * @param ctx                   TLS context to use
- * @param crypto_api_cert       String representing the certificate to load.
+ * @param cryptoapi_cert       String representing the certificate to load.
  */
 #ifdef ENABLE_CRYPTOAPI
 void tls_ctx_load_cryptoapi(struct tls_root_ctx *ctx, const char *cryptoapi_cert);
@@ -312,6 +315,9 @@ int tls_ctx_use_management_external_key(struct tls_root_ctx *ctx);
  *                              inline files.
  * @param ca_file_inline        True if ca_file is an inline file
  * @param ca_path               The path to load the CAs from
+ * @param tls_server            True if we are the server side of the TLS
+ *                              connection and should use the CA for verifying
+ *                              client certificates
  */
 void tls_ctx_load_ca(struct tls_root_ctx *ctx, const char *ca_file,
                      bool ca_file_inline, const char *ca_path, bool tls_server);
@@ -506,7 +512,6 @@ int key_state_write_ciphertext(struct key_state_ssl *ks_ssl,
  * @param ks_ssl       - The security parameter state for this %key
  *                       session.
  * @param buf          - A buffer in which to store the plaintext.
- * @param maxlen       - The maximum number of bytes to extract.
  *
  * @return The return value indicates whether the data was successfully
  *     processed:
@@ -529,12 +534,12 @@ int key_state_read_plaintext(struct key_state_ssl *ks_ssl, struct buffer *buf);
  *
  ***************************************/
 
-/*
+/**
  * Print a one line summary of SSL/TLS session handshake.
  */
 void print_details(struct key_state_ssl *ks_ssl, const char *prefix);
 
-/*
+/**
  * Show the TLS ciphers that are available for us to use in the
  * library depending on the TLS version. This function prints
  * a list of ciphers without headers/footers.
@@ -549,16 +554,10 @@ show_available_tls_ciphers_list(const char *cipher_list,
                                 const char *tls_cert_profile,
                                 bool tls13);
 
-/*
+/**
  * Show the available elliptic curves in the crypto library
  */
 void show_available_curves(void);
-
-/*
- * The OpenSSL library has a notion of preference in TLS ciphers.  Higher
- * preference == more secure. Return the highest preference cipher.
- */
-void get_highest_preference_tls_cipher(char *buf, int size);
 
 /**
  * return a pointer to a static memory area containing the

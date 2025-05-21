@@ -26,6 +26,7 @@
 
 #include "buffer.h"
 #include "env_set.h"
+#include "tun.h"
 
 enum dns_security {
     DNS_SECURITY_UNSET,
@@ -67,11 +68,21 @@ struct dns_server {
     const char *sni;
 };
 
+struct dns_updown_runner_info {
+    bool required;
+    int fds[2];
+#if !defined(_WIN32)
+    pid_t pid;
+#endif
+};
+
 struct dns_options {
     struct dns_domain *search_domains;
     struct dns_server *servers_prepull;
     struct dns_server *servers;
     struct gc_arena gc;
+    const char *updown;
+    bool user_set_updown;
 };
 
 /**
@@ -129,7 +140,8 @@ bool dns_options_verify(int msglevel, const struct dns_options *o);
  * @param   gc          Pointer to the gc_arena to use for the clone
  * @return              The dns_options clone
  */
-struct dns_options clone_dns_options(const struct dns_options o, struct gc_arena *gc);
+struct dns_options clone_dns_options(const struct dns_options *o,
+                                     struct gc_arena *gc);
 
 /**
  * Saves and resets the server options, so that pulled ones don't mix in.
@@ -146,12 +158,14 @@ void dns_options_preprocess_pull(struct dns_options *o);
 void dns_options_postprocess_pull(struct dns_options *o);
 
 /**
- * Puts the DNS options into an environment set.
- *
- * @param   o           Pointer to the DNS options to set
- * @param   es          Pointer to the env_set to set the options into
+ * Invokes the action associated with bringing DNS up or down
+ * @param   up          Boolean to set this call to "up" when true
+ * @param   o           Pointer to the program options
+ * @param   tt          Pointer to the connection's tuntap struct
+ * @param   duri        Pointer to the updown runner info struct
  */
-void setenv_dns_options(const struct dns_options *o, struct env_set *es);
+void run_dns_up_down(bool up, struct options *o, const struct tuntap *tt,
+                     struct dns_updown_runner_info *duri);
 
 /**
  * Prints configured DNS options.

@@ -94,14 +94,21 @@ struct options_pre_connect
 #error "At least one of OpenSSL or mbed TLS needs to be defined."
 #endif
 
+struct local_entry
+{
+    const char *local;
+    const char *port;
+    int proto;
+};
+
 struct connection_entry
 {
+    struct local_list *local_list;
     int proto;
     sa_family_t af;
     const char *local_port;
     bool local_port_defined;
     const char *remote_port;
-    const char *local;
     const char *remote;
     bool remote_float;
     bool bind_defined;
@@ -178,6 +185,12 @@ struct remote_entry
 };
 
 #define CONNECTION_LIST_SIZE 64
+
+struct local_list
+{
+    int len;
+    struct local_entry *array[CONNECTION_LIST_SIZE];
+};
 
 struct connection_list
 {
@@ -492,6 +505,7 @@ struct options
     const char *client_config_dir;
     bool ccd_exclusive;
     bool disable;
+    const char *override_username;
     int n_bcast_buf;
     int tcp_queue_limit;
     struct iroute *iroutes;
@@ -559,6 +573,8 @@ struct options
     const char *ciphername;
     bool enable_ncp_fallback;      /**< If defined fall back to
                                    * ciphername if NCP fails */
+    /** The original ncp_ciphers specified by the user in the configuration*/
+    const char *ncp_ciphers_conf;
     const char *ncp_ciphers;
     const char *authname;
     const char *engine;
@@ -902,6 +918,8 @@ void options_string_import(struct options *options,
                            struct env_set *es);
 
 bool key_is_external(const struct options *options);
+
+bool has_udp_in_local_list(const struct options *options);
 
 /**
  * Returns whether the current configuration has dco enabled.

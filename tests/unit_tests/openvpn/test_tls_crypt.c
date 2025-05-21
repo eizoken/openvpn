@@ -157,7 +157,8 @@ test_tls_crypt_setup(void **state)
     struct test_tls_crypt_context *ctx = calloc(1, sizeof(*ctx));
     *state = ctx;
 
-    struct key key = { 0 };
+    struct key_parameters key = { .cipher = { 0 }, .hmac = { 0 },
+                                  .hmac_size = MAX_HMAC_KEY_LENGTH, .cipher_size = MAX_CIPHER_KEY_LENGTH };
 
     ctx->kt = tls_crypt_kt();
     if (!ctx->kt.cipher || !ctx->kt.digest)
@@ -240,7 +241,6 @@ test_tls_crypt_secure_reneg_key(void **state)
 
     struct gc_arena gc = gc_new();
 
-    struct tls_multi multi = { 0 };
     struct tls_session session = { 0 };
 
     struct tls_options tls_opt = { 0 };
@@ -249,7 +249,7 @@ test_tls_crypt_secure_reneg_key(void **state)
     tls_opt.frame.buf.payload_size = 512;
     session.opt = &tls_opt;
 
-    tls_session_generate_dynamic_tls_crypt_key(&multi, &session);
+    tls_session_generate_dynamic_tls_crypt_key(&session);
 
     struct tls_wrap_ctx *rctx = &session.tls_wrap_reneg;
 
@@ -271,7 +271,7 @@ test_tls_crypt_secure_reneg_key(void **state)
     memset(&session.tls_wrap.original_wrap_keydata.keys, 0x00, sizeof(session.tls_wrap.original_wrap_keydata.keys));
     session.tls_wrap.original_wrap_keydata.n = 2;
 
-    tls_session_generate_dynamic_tls_crypt_key(&multi, &session);
+    tls_session_generate_dynamic_tls_crypt_key(&session);
     tls_crypt_wrap(&ctx->source, &rctx->work, &rctx->opt);
     assert_int_equal(buf_len(&ctx->source) + 40, buf_len(&rctx->work));
 
@@ -280,7 +280,7 @@ test_tls_crypt_secure_reneg_key(void **state)
 
     /* XOR should not force a different key */
     memset(&session.tls_wrap.original_wrap_keydata.keys, 0x42, sizeof(session.tls_wrap.original_wrap_keydata.keys));
-    tls_session_generate_dynamic_tls_crypt_key(&multi, &session);
+    tls_session_generate_dynamic_tls_crypt_key(&session);
 
     tls_crypt_wrap(&ctx->source, &rctx->work, &rctx->opt);
     assert_int_equal(buf_len(&ctx->source) + 40, buf_len(&rctx->work));
@@ -367,7 +367,8 @@ tls_crypt_fail_invalid_key(void **state)
     skip_if_tls_crypt_not_supported(ctx);
 
     /* Change decrypt key */
-    struct key key = { { 1 } };
+    struct key_parameters key = { .cipher = { 1 }, .hmac = { 1 },
+                                  .cipher_size = MAX_CIPHER_KEY_LENGTH, .hmac_size = MAX_HMAC_KEY_LENGTH };
     free_key_ctx(&ctx->co.key_ctx_bi.decrypt);
     init_key_ctx(&ctx->co.key_ctx_bi.decrypt, &key, &ctx->kt, false, "TEST");
 
@@ -534,7 +535,7 @@ tls_crypt_v2_wrap_unwrap_max_metadata(void **state)
         .mode = TLS_WRAP_CRYPT,
         .tls_crypt_v2_server_key = ctx->server_keys.encrypt,
     };
-    assert_true(tls_crypt_v2_extract_client_key(&ctx->wkc, &wrap_ctx, NULL));
+    assert_true(tls_crypt_v2_extract_client_key(&ctx->wkc, &wrap_ctx, NULL, true));
     tls_wrap_free(&wrap_ctx);
 }
 

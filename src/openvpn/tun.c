@@ -63,9 +63,6 @@ print_tun_backend_driver(enum tun_driver_type driver)
         case WINDOWS_DRIVER_TAP_WINDOWS6:
             return "tap-windows6";
 
-        case WINDOWS_DRIVER_WINTUN:
-            return "wintun";
-
         case DRIVER_GENERIC_TUNTAP:
             return "tun/tap";
 
@@ -183,9 +180,10 @@ do_dns_domain_service(bool add, const struct tuntap *tt)
 {
     ack_message_t ack;
     struct gc_arena gc = gc_new();
-    HANDLE pipe = tt->options.msg_channel;
+    const struct tuntap_options *o = &tt->options;
 
-    if (!tt->options.domain) /* no  domain to add or delete */
+    /* no domains to add or delete */
+    if (!o->domain && !o->domain_search_list[0])
     {
         goto out;
     }
@@ -203,28 +201,49 @@ do_dns_domain_service(bool add, const struct tuntap *tt)
         .addr_len = 0       /* add/delete only the domain, not DNS servers */
     };
 
+    /* interface name is required */
     strncpynt(dns.iface.name, tt->actual_name, sizeof(dns.iface.name));
-    strncpynt(dns.domains, tt->options.domain, sizeof(dns.domains));
-    /* truncation of domain name is not checked as it can't happen
-     * with 512 bytes room in dns.domains.
-     */
 
-    msg(D_LOW, "%s dns domain on '%s' (if_index = %d) using service",
+    /* only use domain when there are no search domains */
+    if (o->domain && !o->domain_search_list[0])
+    {
+        strncpynt(dns.domains, o->domain, sizeof(dns.domains));
+    }
+
+    /* Create a comma separated list of search domains */
+    for (int i = 0; i < N_SEARCH_LIST_LEN && o->domain_search_list[i]; ++i)
+    {
+        size_t dstlen = strlen(dns.domains);
+        size_t srclen = strlen(o->domain_search_list[i]);
+        size_t extra = dstlen ? 2 : 1; /* space for comma and NUL */
+        if (dstlen + srclen + extra > sizeof(dns.domains))
+        {
+            msg(M_WARN, "DNS search domains sent to service truncated to %d", i);
+            break;
+        }
+        if (dstlen)
+        {
+            dns.domains[dstlen++] = ',';
+        }
+        strncpy(dns.domains + dstlen, o->domain_search_list[i], srclen + 1);
+    }
+
+    msg(D_LOW, "%s DNS domains on '%s' (if_index = %d) using service",
         (add ? "Setting" : "Deleting"), dns.iface.name, dns.iface.index);
-    if (!send_msg_iservice(pipe, &dns, sizeof(dns), &ack, "TUN"))
+    if (!send_msg_iservice(o->msg_channel, &dns, sizeof(dns), &ack, "TUN"))
     {
         goto out;
     }
 
     if (ack.error_number != NO_ERROR)
     {
-        msg(M_WARN, "TUN: %s dns domain failed using service: %s [status=%u if_name=%s]",
+        msg(M_WARN, "TUN: %s DNS domains failed using service: %s [status=%u if_name=%s]",
             (add ? "adding" : "deleting"), strerror_win32(ack.error_number, &gc),
             ack.error_number, dns.iface.name);
         goto out;
     }
 
-    msg(M_INFO, "DNS domain %s using service", (add ? "set" : "deleted"));
+    msg(M_INFO, "DNS domains %s using service", (add ? "set" : "deleted"));
 
 out:
     gc_free(&gc);
@@ -429,6 +448,67 @@ do_dns_domain_wmic(bool add, const struct tuntap *tt)
     argv_free(&argv);
 }
 
+/**
+ * Requests the interactive service to create a VPN adapter of the specified type.
+ *
+ * @param msg_channel Handle to the interactive service communication pipe.
+ * @param driver_type Adapter type to create (e.g., TAP, Wintun, DCO).
+ *
+ * @return true on success, false on failure.
+ */
+static bool
+do_create_adapter_service(HANDLE msg_channel, enum tun_driver_type driver_type)
+{
+    bool ret = false;
+    ack_message_t ack;
+    struct gc_arena gc = gc_new();
+
+    adapter_type_t t;
+    switch (driver_type)
+    {
+        case WINDOWS_DRIVER_TAP_WINDOWS6:
+            t = ADAPTER_TYPE_TAP;
+            break;
+
+        case DRIVER_DCO:
+            t = ADAPTER_TYPE_DCO;
+            break;
+
+        default:
+            msg(M_NONFATAL, "Invalid backend driver %s", print_tun_backend_driver(driver_type));
+            goto out;
+    }
+
+    create_adapter_message_t msg = {
+        .header = {
+            msg_create_adapter,
+            sizeof(create_adapter_message_t),
+            0
+        },
+        .adapter_type = t
+    };
+
+    if (!send_msg_iservice(msg_channel, &msg, sizeof(msg), &ack, "create_adapter"))
+    {
+        goto out;
+    }
+
+    if (ack.error_number != NO_ERROR)
+    {
+        msg(M_NONFATAL, "TUN: creating %s adapter using service failed: %s [status=%u]",
+            print_tun_backend_driver(driver_type), strerror_win32(ack.error_number, &gc), ack.error_number);
+    }
+    else
+    {
+        msg(M_INFO, "%s adapter created using service", print_tun_backend_driver(driver_type));
+        ret = true;
+    }
+
+out:
+    gc_free(&gc);
+    return ret;
+}
+
 #endif /* ifdef _WIN32 */
 
 #ifdef TARGET_SOLARIS
@@ -437,7 +517,7 @@ static void solaris_error_close(struct tuntap *tt, const struct env_set *es, con
 #include <stropts.h>
 #endif
 
-#if defined(TARGET_DARWIN) && HAVE_NET_IF_UTUN_H
+#if defined(TARGET_DARWIN)
 #include <sys/kern_control.h>
 #include <net/if_utun.h>
 #include <sys/sys_domain.h>
@@ -626,52 +706,14 @@ check_addr_clash(const char *name,
     gc_free(&gc);
 }
 
-/*
- * Issue a warning if ip/netmask (on the virtual IP network) conflicts with
- * the settings on the local LAN.  This is designed to flag issues where
- * (for example) the OpenVPN server LAN is running on 192.168.1.x, but then
- * an OpenVPN client tries to connect from a public location that is also running
- * off of a router set to 192.168.1.x.
- */
-void
-check_subnet_conflict(const in_addr_t ip,
-                      const in_addr_t netmask,
-                      const char *prefix)
-{
-#if 0 /* too many false positives */
-    struct gc_arena gc = gc_new();
-    in_addr_t lan_gw = 0;
-    in_addr_t lan_netmask = 0;
-
-    if (get_default_gateway(&lan_gw, &lan_netmask) && lan_netmask)
-    {
-        const in_addr_t lan_network = lan_gw & lan_netmask;
-        const in_addr_t network = ip & netmask;
-
-        /* do the two subnets defined by network/netmask and lan_network/lan_netmask intersect? */
-        if ((network & lan_netmask) == lan_network
-            || (lan_network & netmask) == network)
-        {
-            msg(M_WARN, "WARNING: potential %s subnet conflict between local LAN [%s/%s] and remote VPN [%s/%s]",
-                prefix,
-                print_in_addr_t(lan_network, 0, &gc),
-                print_in_addr_t(lan_netmask, 0, &gc),
-                print_in_addr_t(network, 0, &gc),
-                print_in_addr_t(netmask, 0, &gc));
-        }
-    }
-    gc_free(&gc);
-#endif /* if 0 */
-}
-
 void
 warn_on_use_of_common_subnets(openvpn_net_ctx_t *ctx)
 {
     struct gc_arena gc = gc_new();
     struct route_gateway_info rgi;
-    const int needed = (RGI_ADDR_DEFINED|RGI_NETMASK_DEFINED);
+    const unsigned int needed = (RGI_ADDR_DEFINED|RGI_NETMASK_DEFINED);
 
-    get_default_gateway(&rgi, ctx);
+    get_default_gateway(&rgi, 0, ctx);
     if ((rgi.flags & needed) == needed)
     {
         const in_addr_t lan_network = rgi.gateway.addr & rgi.gateway.netmask;
@@ -922,15 +964,6 @@ init_tun(const char *dev,        /* --dev option */
                                      tt->remote_netmask);
                 }
             }
-
-            if (!tun_p2p)
-            {
-                check_subnet_conflict(tt->local, tt->remote_netmask, "TUN/TAP adapter");
-            }
-            else
-            {
-                check_subnet_conflict(tt->local, IPV4_NETMASK_HOST, "TUN/TAP adapter");
-            }
         }
 
 #ifdef _WIN32
@@ -992,7 +1025,7 @@ init_tun_post(struct tuntap *tt,
 #ifdef _WIN32
     if (tt->backend_driver == DRIVER_DCO)
     {
-        dco_start_tun(tt);
+        tt->dco.tt = tt;
         return;
     }
 
@@ -1000,37 +1033,8 @@ init_tun_post(struct tuntap *tt,
     overlapped_io_init(&tt->writes, frame, TRUE);
     tt->adapter_index = TUN_ADAPTER_INDEX_INVALID;
 
-    if (tt->backend_driver == WINDOWS_DRIVER_WINTUN)
-    {
-        tt->wintun_send_ring_handle = CreateFileMapping(INVALID_HANDLE_VALUE, NULL,
-                                                        PAGE_READWRITE,
-                                                        0,
-                                                        sizeof(struct tun_ring),
-                                                        NULL);
-        tt->wintun_receive_ring_handle = CreateFileMapping(INVALID_HANDLE_VALUE,
-                                                           NULL,
-                                                           PAGE_READWRITE,
-                                                           0,
-                                                           sizeof(struct tun_ring),
-                                                           NULL);
-        if ((tt->wintun_send_ring_handle == NULL) || (tt->wintun_receive_ring_handle == NULL))
-        {
-            msg(M_FATAL, "Cannot allocate memory for ring buffer");
-        }
-
-        tt->rw_handle.read = CreateEvent(NULL, FALSE, FALSE, NULL);
-        tt->rw_handle.write = CreateEvent(NULL, FALSE, FALSE, NULL);
-
-        if ((tt->rw_handle.read == NULL) || (tt->rw_handle.write == NULL))
-        {
-            msg(M_FATAL, "Cannot create events for ring buffer");
-        }
-    }
-    else
-    {
-        tt->rw_handle.read = tt->reads.overlapped.hEvent;
-        tt->rw_handle.write = tt->writes.overlapped.hEvent;
-    }
+    tt->rw_handle.read = tt->reads.overlapped.hEvent;
+    tt->rw_handle.write = tt->writes.overlapped.hEvent;
 #endif /* ifdef _WIN32 */
 }
 
@@ -1068,7 +1072,7 @@ delete_route_connected_v6_net(const struct tuntap *tt)
     r6.metric  = 0;                     /* connected route */
     r6.flags   = RT_DEFINED | RT_ADDED | RT_METRIC_DEFINED;
     route_ipv6_clear_host_bits(&r6);
-    delete_route_ipv6(&r6, tt, 0, NULL, NULL);
+    delete_route_ipv6(&r6, tt, NULL, NULL);
 }
 #endif /* if defined(_WIN32) || defined(TARGET_DARWIN) || defined(TARGET_NETBSD) || defined(TARGET_OPENBSD) */
 
@@ -1104,7 +1108,7 @@ create_arbitrary_remote( struct tuntap *tt )
  *
  * @param tt        the tuntap interface context
  * @param ifname    the human readable interface name
- * @param mtu       the MTU value to set the interface to
+ * @param tun_mtu   the MTU value to set the interface to
  * @param es        the environment to be used when executing the commands
  * @param ctx       the networking API opaque context
  */
@@ -1303,7 +1307,7 @@ do_ifconfig_ipv6(struct tuntap *tt, const char *ifname, int tun_mtu,
  *
  * @param tt        the tuntap interface context
  * @param ifname    the human readable interface name
- * @param mtu       the MTU value to set the interface to
+ * @param tun_mtu   the MTU value to set the interface to
  * @param es        the environment to be used when executing the commands
  * @param ctx       the networking API opaque context
  */
@@ -1631,6 +1635,13 @@ do_ifconfig_ipv4(struct tuntap *tt, const char *ifname, int tun_mtu,
     {
         windows_set_mtu(tt->adapter_index, AF_INET, tun_mtu);
     }
+#elif defined(TARGET_HAIKU)
+    /* example: ifconfig tun/0 inet 1.1.1.1 255.255.255.0 mtu 1450 up */
+    argv_printf(&argv, "%s %s inet %s %s mtu %d up", IFCONFIG_PATH,
+                ifname, ifconfig_local, ifconfig_remote_netmask, tun_mtu);
+
+    argv_msg(M_INFO, &argv);
+    openvpn_execve_check(&argv, es, S_FATAL, "Haiku ifconfig failed");
 #else  /* if defined(TARGET_LINUX) */
     msg(M_FATAL, "Sorry, but I don't know how to do 'ifconfig' commands on this operating system.  You should ifconfig your TUN/TAP device manually or use an --up script.");
 #endif /* if defined(TARGET_LINUX) */
@@ -1775,7 +1786,7 @@ clear_tuntap(struct tuntap *tuntap)
 #endif
 }
 
-#if defined (TARGET_OPENBSD) || (defined(TARGET_DARWIN) && HAVE_NET_IF_UTUN_H)
+#if defined(TARGET_OPENBSD) || defined(TARGET_DARWIN)
 
 /*
  * OpenBSD and Mac OS X when using utun
@@ -1864,7 +1875,7 @@ read_tun_header(struct tuntap *tt, uint8_t *buf, int len)
         return read(tt->fd, buf, len);
     }
 }
-#endif /* if defined (TARGET_OPENBSD) || (defined(TARGET_DARWIN) && HAVE_NET_IF_UTUN_H) */
+#endif /* if defined (TARGET_OPENBSD) || defined(TARGET_DARWIN) */
 
 bool
 tun_name_is_fixed(const char *dev)
@@ -1909,10 +1920,15 @@ open_tun_generic(const char *dev, const char *dev_type, const char *dev_node,
         {
             for (int i = 0; i < 256; ++i)
             {
+                /* some platforms have a dedicated directory per driver */
+                char *sep = "";
+#if defined(TARGET_HAIKU)
+                sep = "/";
+#endif
                 snprintf(tunname, sizeof(tunname),
-                         "/dev/%s%d", dev, i);
+                         "/dev/%s%s%d", dev, sep, i);
                 snprintf(dynamic_name, sizeof(dynamic_name),
-                         "%s%d", dev, i);
+                         "%s%s%d", dev, sep, i);
                 if ((tt->fd = open(tunname, O_RDWR)) > 0)
                 {
                     dynamic_opened = true;
@@ -3203,14 +3219,12 @@ read_tun(struct tuntap *tt, uint8_t *buf, int len)
  * (http://newosxbook.com/src.jl?tree=listings&file=17-15-utun.c)
  */
 
-#ifdef HAVE_NET_IF_UTUN_H
-
 /* Helper functions that tries to open utun device
  * return -2 on early initialization failures (utun not supported
- * at all (old OS X) and -1 on initlization failure of utun
- * device (utun works but utunX is already used */
-static
-int
+ * at all) and -1 on initlization failure of utun
+ * device (utun works but utunX is already used)
+ */
+static int
 utun_open_helper(struct ctl_info ctlInfo, int utunnum)
 {
     struct sockaddr_ctl sc;
@@ -3334,13 +3348,10 @@ open_darwin_utun(const char *dev, const char *dev_type, const char *dev_node, st
     tt->backend_driver = DRIVER_UTUN;
 }
 
-#endif /* ifdef HAVE_NET_IF_UTUN_H */
-
 void
 open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tuntap *tt,
          openvpn_net_ctx_t *ctx)
 {
-#ifdef HAVE_NET_IF_UTUN_H
     /* If dev_node does not start start with utun assume regular tun/tap */
     if ((!dev_node && tt->type==DEV_TYPE_TUN)
         || (dev_node && !strncmp(dev_node, "utun", 4)))
@@ -3375,7 +3386,6 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
         }
     }
     else
-#endif /* ifdef HAVE_NET_IF_UTUN_H */
     {
 
         /* Use plain dev-node tun to select /dev/tun style
@@ -3419,27 +3429,27 @@ close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
 int
 write_tun(struct tuntap *tt, uint8_t *buf, int len)
 {
-#ifdef HAVE_NET_IF_UTUN_H
     if (tt->backend_driver == DRIVER_UTUN)
     {
         return write_tun_header(tt, buf, len);
     }
     else
-#endif
-    return write(tt->fd, buf, len);
+    {
+        return write(tt->fd, buf, len);
+    }
 }
 
 int
 read_tun(struct tuntap *tt, uint8_t *buf, int len)
 {
-#ifdef HAVE_NET_IF_UTUN_H
     if (tt->backend_driver == DRIVER_UTUN)
     {
         return read_tun_header(tt, buf, len);
     }
     else
-#endif
-    return read(tt->fd, buf, len);
+    {
+        return read(tt->fd, buf, len);
+    }
 }
 
 #elif defined(TARGET_AIX)
@@ -3964,10 +3974,6 @@ get_tap_reg(struct gc_arena *gc)
                     {
                         windows_driver = WINDOWS_DRIVER_TAP_WINDOWS6;
                     }
-                    else if (strcasecmp(component_id, WINTUN_COMPONENT_ID) == 0)
-                    {
-                        windows_driver = WINDOWS_DRIVER_WINTUN;
-                    }
                     else if (strcasecmp(component_id, "ovpn-dco") == 0)
                     {
                         windows_driver = DRIVER_DCO;
@@ -4274,7 +4280,7 @@ show_tap_win_adapters(int msglev, int warnlev)
 }
 
 /*
- * Lookup a TAP-Windows or Wintun adapter by GUID.
+ * Lookup an adapter by GUID.
  */
 static const struct tap_reg *
 get_adapter_by_guid(const char *guid, const struct tap_reg *tap_reg)
@@ -4329,7 +4335,7 @@ at_least_one_tap_win(const struct tap_reg *tap_reg)
 {
     if (!tap_reg)
     {
-        msg(M_FATAL, "There are no TAP-Windows, Wintun or ovpn-dco adapters "
+        msg(M_FATAL, "There are no TAP-Windows or ovpn-dco adapters "
             "on this system.  You should be able to create an adapter "
             "by using tapctl.exe utility.");
     }
@@ -5447,11 +5453,8 @@ netsh_set_dns6_servers(const struct in6_addr *addr_list,
                     NETSH_PATH_SUFFIX, adapter_index,
                     print_in6_addr(addr_list[i], 0, &gc));
 
-        /* disable slow address validation on Windows 7 and higher */
-        if (win32_version_info() >= WIN_7)
-        {
-            argv_printf_cat(&argv, "%s", "validate=no");
-        }
+        /* disable slow address validation */
+        argv_printf_cat(&argv, "%s", "validate=no");
 
         /* Treat errors while adding as non-fatal as we do not check for duplicates */
         netsh_command(&argv, 1, (i==0) ? M_FATAL : M_NONFATAL);
@@ -5517,9 +5520,8 @@ netsh_ifconfig_options(const char *type,
                             adapter_index,
                             print_in_addr_t(addr_list[i], 0, &gc));
 
-                /* disable slow address validation on Windows 7 and higher */
-                /* only for DNS */
-                if (is_dns && win32_version_info() >= WIN_7)
+                /* disable slow address validation for DNS */
+                if (is_dns)
                 {
                     argv_printf_cat(&argv, "%s", "validate=no");
                 }
@@ -6044,46 +6046,6 @@ register_dns_service(const struct tuntap *tt)
     gc_free(&gc);
 }
 
-static bool
-service_register_ring_buffers(const struct tuntap *tt)
-{
-    HANDLE msg_channel = tt->options.msg_channel;
-    ack_message_t ack;
-    bool ret = true;
-    struct gc_arena gc = gc_new();
-
-    register_ring_buffers_message_t msg = {
-        .header = {
-            msg_register_ring_buffers,
-            sizeof(register_ring_buffers_message_t),
-            0
-        },
-        .device = tt->hand,
-        .send_ring_handle = tt->wintun_send_ring_handle,
-        .receive_ring_handle = tt->wintun_receive_ring_handle,
-        .send_tail_moved = tt->rw_handle.read,
-        .receive_tail_moved = tt->rw_handle.write
-    };
-
-    if (!send_msg_iservice(msg_channel, &msg, sizeof(msg), &ack, "Register ring buffers"))
-    {
-        ret = false;
-    }
-    else if (ack.error_number != NO_ERROR)
-    {
-        msg(M_NONFATAL, "Register ring buffers failed using service: %s [status=0x%x]",
-            strerror_win32(ack.error_number, &gc), ack.error_number);
-        ret = false;
-    }
-    else
-    {
-        msg(M_INFO, "Ring buffers registered via service");
-    }
-
-    gc_free(&gc);
-    return ret;
-}
-
 void
 fork_register_dns_action(struct tuntap *tt)
 {
@@ -6321,58 +6283,6 @@ tuntap_set_ip_addr(struct tuntap *tt,
     gc_free(&gc);
 }
 
-static bool
-wintun_register_ring_buffer(struct tuntap *tt, const char *device_guid)
-{
-    bool ret = true;
-
-    tt->wintun_send_ring = (struct tun_ring *)MapViewOfFile(tt->wintun_send_ring_handle,
-                                                            FILE_MAP_ALL_ACCESS,
-                                                            0,
-                                                            0,
-                                                            sizeof(struct tun_ring));
-
-    tt->wintun_receive_ring = (struct tun_ring *)MapViewOfFile(tt->wintun_receive_ring_handle,
-                                                               FILE_MAP_ALL_ACCESS,
-                                                               0,
-                                                               0,
-                                                               sizeof(struct tun_ring));
-
-    if (tt->options.msg_channel)
-    {
-        ret = service_register_ring_buffers(tt);
-    }
-    else
-    {
-        if (!register_ring_buffers(tt->hand,
-                                   tt->wintun_send_ring,
-                                   tt->wintun_receive_ring,
-                                   tt->rw_handle.read,
-                                   tt->rw_handle.write))
-        {
-            switch (GetLastError())
-            {
-                case ERROR_ACCESS_DENIED:
-                    msg(M_FATAL, "ERROR:  Wintun requires SYSTEM privileges and therefore "
-                        "should be used with interactive service. If you want to "
-                        "use openvpn from command line, you need to do SYSTEM "
-                        "elevation yourself (for example with psexec).");
-                    break;
-
-                case ERROR_ALREADY_INITIALIZED:
-                    msg(M_NONFATAL, "Adapter %s is already in use", device_guid);
-                    break;
-
-                default:
-                    msg(M_NONFATAL | M_ERRNO, "Failed to register ring buffers");
-            }
-            ret = false;
-        }
-
-    }
-    return ret;
-}
-
 static void
 tuntap_set_connected(const struct tuntap *tt)
 {
@@ -6532,8 +6442,7 @@ tun_try_open_device(struct tuntap *tt, const char *device_guid, const struct dev
     const char *path = NULL;
     char tuntap_device_path[256];
 
-    if (tt->backend_driver == WINDOWS_DRIVER_WINTUN
-        || tt->backend_driver == DRIVER_DCO)
+    if (tt->backend_driver == DRIVER_DCO)
     {
         const struct device_instance_id_interface *dev_if;
 
@@ -6587,18 +6496,6 @@ tun_try_open_device(struct tuntap *tt, const char *device_guid, const struct dev
         return false;
     }
 
-    if (tt->backend_driver == WINDOWS_DRIVER_WINTUN)
-    {
-        /* Wintun adapter may be considered "open" after ring buffers are successfuly registered. */
-        if (!wintun_register_ring_buffer(tt, device_guid))
-        {
-            msg(D_TUNTAP_INFO, "Failed to register %s adapter ring buffers", device_guid);
-            CloseHandle(tt->hand);
-            tt->hand = NULL;
-            return false;
-        }
-    }
-
     return true;
 }
 
@@ -6608,9 +6505,8 @@ tun_open_device(struct tuntap *tt, const char *dev_node, const char **device_gui
     const struct tap_reg *tap_reg = get_tap_reg(gc);
     const struct panel_reg *panel_reg = get_panel_reg(gc);
     const struct device_instance_id_interface *device_instance_id_interface = get_device_instance_id_interface(gc);
-    uint8_t actual_buffer[256];
 
-    at_least_one_tap_win(tap_reg);
+    uint8_t actual_buffer[256];
 
     /*
      * Lookup the device name in the registry, using the --dev-node high level name.
@@ -6641,6 +6537,7 @@ tun_open_device(struct tuntap *tt, const char *dev_node, const char **device_gui
     else
     {
         int device_number = 0;
+        int adapters_created = 0;
 
         /* Try opening all TAP devices until we find one available */
         while (true)
@@ -6656,7 +6553,22 @@ tun_open_device(struct tuntap *tt, const char *dev_node, const char **device_gui
 
             if (!*device_guid)
             {
-                msg(M_FATAL, "All %s adapters on this system are currently in use or disabled.", print_tun_backend_driver(tt->backend_driver));
+                /* try to create an adapter a few times if we have a service pipe handle */
+                if ((++adapters_created > 10) || !do_create_adapter_service(tt->options.msg_channel, tt->backend_driver))
+                {
+                    msg(M_FATAL, "All %s adapters on this system are currently in use or disabled.", print_tun_backend_driver(tt->backend_driver));
+                }
+                else
+                {
+                    /* we have created a new adapter so we must reinitialize adapters structs */
+                    tap_reg = get_tap_reg(gc);
+                    panel_reg = get_panel_reg(gc);
+                    device_instance_id_interface = get_device_instance_id_interface(gc);
+
+                    device_number = 0;
+
+                    continue;
+                }
             }
 
             if (tt->backend_driver != windows_driver)
@@ -6930,16 +6842,6 @@ close_tun_handle(struct tuntap *tt)
             msg(M_WARN | M_ERRNO, "Warning: CloseHandle failed on %s adapter", adaptertype);
         }
         tt->hand = NULL;
-    }
-
-    if (tt->backend_driver == WINDOWS_DRIVER_WINTUN)
-    {
-        CloseHandle(tt->rw_handle.read);
-        CloseHandle(tt->rw_handle.write);
-        UnmapViewOfFile(tt->wintun_send_ring);
-        UnmapViewOfFile(tt->wintun_receive_ring);
-        CloseHandle(tt->wintun_send_ring_handle);
-        CloseHandle(tt->wintun_receive_ring_handle);
     }
 }
 

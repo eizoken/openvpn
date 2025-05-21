@@ -39,8 +39,12 @@ option(ENABLE_LZ4 "BUILD with lz4" ON)
 option(ENABLE_LZO "BUILD with lzo" ON)
 option(ENABLE_PKCS11 "BUILD with pkcs11-helper" ON)
 option(USE_WERROR "Treat compiler warnings as errors (-Werror)" ON)
+option(FAKE_ANDROID "Target Android but do not use actual cross compile/Android cmake to build for simple compile checks on Linux")
 
-set(PLUGIN_DIR /usr/local/lib/openvpn/plugins CACHE FILEPATH "Location of the plugin directory")
+option(ENABLE_DNS_UPDOWN_BY_DEFAULT "Run --dns-updown hook by default" ON)
+set(DNS_UPDOWN_PATH "${CMAKE_INSTALL_PREFIX}/libexec/openvpn/dns-updown" CACHE STRING "Default location for the DNS up/down script")
+
+set(PLUGIN_DIR "${CMAKE_INSTALL_PREFIX}/lib/openvpn/plugins" CACHE FILEPATH "Location of the plugin directory")
 
 # Create machine readable compile commands
 option(ENABLE_COMPILE_COMMANDS "Generate compile_commands.json and a symlink for clangd to find it" OFF)
@@ -65,8 +69,19 @@ set(CMAKE_CXX_FLAGS_ASAN
     CACHE STRING "Flags used by the C++ compiler during AddressSanitizer builds."
     FORCE)
 
+function(check_and_add_compiler_flag flag variable)
+    check_c_compiler_flag(${flag} ${variable})
+    if (${variable})
+        add_compile_options(${flag})
+    endif()
+endfunction()
+
 if (MSVC)
-    add_definitions(-D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE -D_WINSOCK_DEPRECATED_NO_WARNINGS)
+    add_compile_definitions(
+        _CRT_SECURE_NO_WARNINGS
+        _CRT_NONSTDC_NO_DEPRECATE
+        _WINSOCK_DEPRECATED_NO_WARNINGS
+        )
     if (USE_WERROR)
         add_compile_options(/WX)
     endif ()
@@ -95,11 +110,9 @@ if (MSVC)
     endif()
 else ()
     add_compile_options(-Wall -Wuninitialized)
-    check_c_compiler_flag(-Wno-stringop-truncation NoStringOpTruncation)
-
-    if (${NoStringOpTruncation})
-        add_compile_options(-Wno-stringop-truncation)
-    endif()
+    check_and_add_compiler_flag(-Wno-stringop-truncation NoStringOpTruncation)
+    check_and_add_compiler_flag(-Wstrict-prototypes StrictPrototypes)
+    check_and_add_compiler_flag(-Wold-style-definition OldStyleDefinition)
     # We are not ready for this
     #add_compile_options(-Wconversion -Wno-sign-conversion -Wsign-compare)
     if (USE_WERROR)
@@ -107,9 +120,9 @@ else ()
     endif ()
 endif ()
 
-find_program(PYTHON NAMES python3 python)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 execute_process(
-    COMMAND ${PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/contrib/cmake/parse-version.m4.py ${CMAKE_CURRENT_SOURCE_DIR}/version.m4
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/contrib/cmake/parse-version.m4.py ${CMAKE_CURRENT_SOURCE_DIR}/version.m4
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     )
 include(${CMAKE_CURRENT_BINARY_DIR}/version.cmake)
@@ -122,7 +135,14 @@ set(OPENVPN_VERSION_RESOURCE ${PRODUCT_VERSION_RESOURCE})
 set(CMAKE_C_STANDARD 11)
 
 # Set the various defines for config.h.cmake.in
-if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+if (${CMAKE_SYSTEM_NAME} STREQUAL "Android" OR ${FAKE_ANDROID})
+    set(TARGET_ANDROID YES)
+    set(ENABLE_ASYNC_PUSH YES)
+    set(ENABLE_SITNL YES)
+    set(HAVE_LINUX_TYPES_H 1)
+    # Wacky workaround as OpenSSL package detection is otherwise broken (https://stackoverflow.com/questions/45958214/android-cmake-could-not-find-openssl)
+    list(APPEND CMAKE_FIND_ROOT_PATH ${OPENSSL_ROOT_DIR})
+elseif (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
     set(TARGET_LINUX YES)
     set(ENABLE_ASYNC_PUSH YES)
     set(ENABLE_LINUXDCO YES)
@@ -145,7 +165,6 @@ elseif (WIN32)
     set(ENABLE_DCO YES)
 elseif (APPLE)
     set(TARGET_DARWIN YES)
-    set(HAVE_NET_IF_UTUN_H YES)
 else()
     message(FATAL_ERROR "Unknown system name: \"${CMAKE_SYSTEM_NAME}\"")
 endif ()
@@ -159,89 +178,102 @@ elseif (WIN32)
     set(TARGET_WIN32 YES)
 endif ()
 
-check_symbol_exists(chroot unistd.h HAVE_CHROOT)
-check_symbol_exists(chdir unistd.h HAVE_CHDIR)
-check_symbol_exists(dup unistd.h HAVE_DUP)
-check_symbol_exists(dup2 unistd.h HAVE_DUP2)
-check_symbol_exists(fork unistd.h HAVE_FORK)
-check_symbol_exists(execve unistd.h HAVE_EXECVE)
-check_symbol_exists(ftruncate unistd.h HAVE_FTRUNCATE)
-check_symbol_exists(nice unistd.h HAVE_NICE)
-check_symbol_exists(setgid unistd.h HAVE_SETGID)
-check_symbol_exists(setuid unistd.h HAVE_SETUID)
-check_symbol_exists(setsid unistd.h HAVE_SETSID)
-check_symbol_exists(getpeereid "unistd.h;sys/socket.h" HAVE_GETPEEREID)
+check_include_files(unistd.h HAVE_UNISTD_H)
+if (HAVE_UNISTD_H)
+    check_symbol_exists(chroot unistd.h HAVE_CHROOT)
+    check_symbol_exists(chdir unistd.h HAVE_CHDIR)
+    check_symbol_exists(dup unistd.h HAVE_DUP)
+    check_symbol_exists(dup2 unistd.h HAVE_DUP2)
+    check_symbol_exists(fork unistd.h HAVE_FORK)
+    check_symbol_exists(execve unistd.h HAVE_EXECVE)
+    check_symbol_exists(ftruncate unistd.h HAVE_FTRUNCATE)
+    check_symbol_exists(nice unistd.h HAVE_NICE)
+    check_symbol_exists(setgid unistd.h HAVE_SETGID)
+    check_symbol_exists(setuid unistd.h HAVE_SETUID)
+    check_symbol_exists(setsid unistd.h HAVE_SETSID)
+    check_symbol_exists(daemon "unistd.h;stdlib.h" HAVE_DAEMON)
+    check_symbol_exists(getpeereid "unistd.h;sys/socket.h" HAVE_GETPEEREID)
+endif()
 
-check_symbol_exists(epoll_create sys/epoll.h HAVE_EPOLL_CREATE)
+check_include_files(grp.h HAVE_GRP_H)
+if (HAVE_GRP_H)
+    check_symbol_exists(getgrnam grp.h HAVE_GETGRNAM)
+endif()
+check_include_files(libgen.h HAVE_LIBGEN_H)
+if (HAVE_LIBGEN_H)
+    check_symbol_exists(basename libgen.h HAVE_BASENAME)
+    check_symbol_exists(dirname libgen.h HAVE_DIRNAME)
+endif()
+check_include_files(pwd.h HAVE_PWD_H)
+if (HAVE_PWD_H)
+    check_symbol_exists(getpwnam pwd.h HAVE_GETPWNAM)
+endif()
+check_include_files(sys/epoll.h HAVE_SYS_EPOLL_H)
+if (HAVE_SYS_EPOLL_H)
+    check_symbol_exists(epoll_create sys/epoll.h HAVE_EPOLL_CREATE)
+endif()
+check_include_files(syslog.h HAVE_SYSLOG_H)
+if (HAVE_SYSLOG_H)
+    check_symbol_exists(openlog syslog.h HAVE_OPENLOG)
+    check_symbol_exists(syslog syslog.h HAVE_SYSLOG)
+endif()
+check_include_files(sys/mman.h HAVE_SYS_MMAN_H)
+if (HAVE_SYS_MMAN_H)
+    check_symbol_exists(mlockall sys/mman.h HAVE_MLOCKALL)
+endif()
+check_include_files(sys/socket.h HAVE_SYS_SOCKET_H)
+if (HAVE_SYS_SOCKET_H)
+    check_symbol_exists(sendmsg sys/socket.h HAVE_SENDMSG)
+    check_symbol_exists(recvmsg sys/socket.h HAVE_RECVMSG)
+    check_symbol_exists(getsockname sys/socket.h HAVE_GETSOCKNAME)
+    # Checking for existence of structs with check_symbol_exists does not work,
+    # so we use check_struct_hash_member with a member instead
+    check_struct_has_member("struct cmsghdr" cmsg_len sys/socket.h HAVE_CMSGHDR)
+endif()
+check_include_files(sys/time.h HAVE_SYS_TIME_H)
+if (HAVE_SYS_TIME_H)
+    check_symbol_exists(gettimeofday sys/time.h HAVE_GETTIMEOFDAY)
+    check_symbol_exists(getrlimit "sys/time.h;sys/resource.h" HAVE_GETRLIMIT)
+endif()
 
-check_symbol_exists(gettimeofday sys/time.h HAVE_GETTIMEOFDAY)
-check_symbol_exists(basename libgen.h HAVE_BASENAME)
 check_symbol_exists(chsize io.h HAVE_CHSIZE)
-check_symbol_exists(daemon "unistd.h;stdlib.h" HAVE_DAEMON)
-check_symbol_exists(dirname libgen.h HAVE_DIRNAME)
 check_symbol_exists(getrlimit sys/resource.h HAVE_GETRLIMIT)
-check_symbol_exists(mlockall sys/mman.h HAVE_MLOCKALL)
-
-check_symbol_exists(sendmsg sys/socket.h HAVE_SENDMSG)
-check_symbol_exists(recvmsg sys/socket.h HAVE_RECVMSG)
-check_symbol_exists(openlog syslog.h HAVE_OPENLOG)
-check_symbol_exists(syslog syslog.h HAVE_SYSLOG)
-check_symbol_exists(getgrnam grp.h HAVE_GETGRNAM)
-check_symbol_exists(getpwnam pwd.h HAVE_GETPWNAM)
-check_symbol_exists(getsockname sys/socket.h HAVE_GETSOCKNAME)
-check_symbol_exists(getrlimit "sys/time.h;sys/resource.h" HAVE_GETRLIMIT)
-
-# Checking for existence of structs with check_symbol_exists does not work,
-# so we use check_struct_hash_member with a member instead
-check_struct_has_member("struct cmsghdr" cmsg_len sys/socket.h HAVE_CMSGHDR)
-
 
 # Some OS (e.g. FreeBSD) need some basic headers to allow
 # including network headers
 set(NETEXTRA sys/types.h)
 check_include_files("${NETEXTRA};netinet/in.h" HAVE_NETINET_IN_H)
-
 if (HAVE_NETINET_IN_H)
     list(APPEND NETEXTRA netinet/in.h)
 endif ()
 
-check_include_files("${NETEXTRA};netinet/in6.h" HAVE_NETINET_IN_H)
+check_include_files(arpa/inet.h HAVE_ARPA_INET_H)
+check_include_files(dlfcn.h HAVE_DLFCN_H)
+check_include_files(dmalloc.h HAVE_DMALLOC_H)
+check_include_files(fcntl.h HAVE_FCNTL_H)
+check_include_files(err.h HAVE_ERR_H)
 check_include_files(linux/if_tun.h HAVE_LINUX_IF_TUN_H)
 check_include_files(linux/sockios.h HAVE_LINUX_SOCKIOS_H)
-check_include_files(dlfcn.h HAVE_DLFCN_H)
-check_include_files(fcntl.h HAVE_FCNTL_H)
-check_include_files(dmalloc.h HAVE_DMALLOC_H)
-check_include_files(err.h HAVE_ERR_H)
-check_include_files(sys/epoll.h HAVE_SYS_EPOLL_H)
-check_include_files(poll.h HAVE_POLL_H)
-check_include_files(sys/socket.h HAVE_SYS_SOCKET_H)
-check_include_files(sys/time.h HAVE_SYS_TIME_H)
 check_include_files(netdb.h HAVE_NETDB_H)
-check_include_files(unistd.h HAVE_UNISTD_H)
-check_include_files(sys/un.h HAVE_SYS_UN_H)
-check_include_files(libgen.h HAVE_LIBGEN_H)
+check_include_files("${NETEXTRA};netinet/in6.h" HAVE_NETINET_IN_H)
 check_include_files(net/if.h HAVE_NET_IF_H)
-check_include_files("${NETEXTRA};netinet/ip.h" HAVE_NETINET_IP_H)
-check_include_files(arpa/inet.h HAVE_ARPA_INET_H)
-check_include_files(net/if_utun.h HAVE_NET_UTUN_H)
+check_include_files("${NETEXTRA};net/if_tun.h" HAVE_NET_IF_TUN_H)
+check_include_files(poll.h HAVE_POLL_H)
+check_include_files("${NETEXTRA};resolv.h" HAVE_RESOLV_H)
 check_include_files(sys/ioctl.h HAVE_SYS_IOCTL_H)
 check_include_files(sys/inotify.h HAVE_SYS_INOTIFY_H)
 check_include_files("${NETEXTRA};sys/uio.h" HAVE_SYS_UIO_H)
-check_include_files(syslog.h HAVE_SYSLOG_H)
+check_include_files(sys/un.h HAVE_SYS_UN_H)
 check_include_files(sys/wait.h HAVE_SYS_WAIT_H)
-check_include_files(grp.h HAVE_GRP_H)
-check_include_files(pwd.h HAVE_PWD_H)
-check_include_files(sys/mman.h HAVE_SYS_MMAN_H)
 
-
-check_include_files("${NETEXTRA};resolv.h" HAVE_RESOLV_H)
-check_include_files("${NETEXTRA};net/if_tun.h" HAVE_NET_IF_TUN_H)
-
-set(CMAKE_EXTRA_INCLUDE_FILES netinet/ip.h)
-check_type_size("struct in_pktinfo" IN_PKTINFO)
-check_struct_has_member("struct in_pktinfo" ipi_spec_dst netinet/ip.h HAVE_IPI_SPEC_DST)
-check_type_size("struct msghdr" MSGHDR)
-set(CMAKE_EXTRA_INCLUDE_FILES)
+check_include_files("${NETEXTRA};netinet/ip.h" HAVE_NETINET_IP_H)
+if (HAVE_NETINET_IP_H)
+    set(CMAKE_EXTRA_INCLUDE_FILES netinet/ip.h)
+    check_type_size("struct in_pktinfo" IN_PKTINFO)
+    check_struct_has_member("struct in_pktinfo" ipi_spec_dst netinet/ip.h HAVE_IPI_SPEC_DST)
+    check_type_size("struct msghdr" MSGHDR)
+    set(CMAKE_EXTRA_INCLUDE_FILES)
+endif()
 
 find_program(IFCONFIG_PATH ifconfig)
 find_program(IPROUTE_PATH ip)
@@ -269,6 +301,7 @@ function(check_mbed_configuration)
     set(CMAKE_REQUIRED_LIBRARIES "mbedtls;mbedx509;mbedcrypto")
     check_symbol_exists(mbedtls_ctr_drbg_update_ret mbedtls/ctr_drbg.h HAVE_MBEDTLS_CTR_DRBG_UPDATE_RET)
     check_symbol_exists(mbedtls_ssl_conf_export_keys_ext_cb mbedtls/ssl.h HAVE_MBEDTLS_SSL_CONF_EXPORT_KEYS_EXT_CB)
+    check_symbol_exists(mbedtls_ssl_set_export_keys_cb mbedtls/ssl.h HAVE_MBEDTLS_SSL_SET_EXPORT_KEYS_CB)
     check_include_files(psa/crypto.h HAVE_MBEDTLS_PSA_CRYPTO_H)
 endfunction()
 
@@ -305,8 +338,8 @@ function(add_library_deps target)
 
     if (MINGW)
         target_compile_definitions(${target} PRIVATE
-                -DWIN32_LEAN_AND_MEAN
-                -DNTDDI_VERSION=NTDDI_VISTA -D_WIN32_WINNT=_WIN32_WINNT_VISTA
+                WIN32_LEAN_AND_MEAN
+                NTDDI_VERSION=NTDDI_VISTA _WIN32_WINNT=_WIN32_WINNT_VISTA
         )
     endif()
 
@@ -341,14 +374,14 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR} src/compat include)
 
 add_custom_command(
     OUTPUT always_rebuild config-version.h
-    COMMAND ${PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/contrib/cmake/git-version.py
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/contrib/cmake/git-version.py
     )
 set(HAVE_CONFIG_VERSION_H YES)
 
 configure_file(config.h.cmake.in config.h)
 configure_file(include/openvpn-plugin.h.in openvpn-plugin.h)
 # TODO we should remove the need for this, and always include config.h
-add_definitions(-DHAVE_CONFIG_H)
+add_compile_definitions(HAVE_CONFIG_H)
 
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
@@ -389,6 +422,8 @@ set(SOURCE_FILES
     src/openvpn/crypto.c
     src/openvpn/crypto.h
     src/openvpn/crypto_backend.h
+    src/openvpn/crypto_epoch.c
+    src/openvpn/crypto_epoch.h
     src/openvpn/crypto_openssl.c
     src/openvpn/crypto_openssl.h
     src/openvpn/crypto_mbedtls.c
@@ -458,6 +493,8 @@ set(SOURCE_FILES
     src/openvpn/mudp.h
     src/openvpn/multi.c
     src/openvpn/multi.h
+    src/openvpn/multi_io.h
+    src/openvpn/multi_io.c
     src/openvpn/ntlm.c
     src/openvpn/ntlm.h
     src/openvpn/occ.c
@@ -567,6 +604,8 @@ add_executable(openvpn ${SOURCE_FILES})
 
 add_library_deps(openvpn)
 
+target_compile_options(openvpn PRIVATE -DDEFAULT_DNS_UPDOWN=\"${DNS_UPDOWN_PATH}\")
+
 if(MINGW)
     target_compile_options(openvpn PRIVATE -municode -UUNICODE)
     target_link_options(openvpn PRIVATE -municode)
@@ -627,7 +666,8 @@ if (BUILD_TESTING)
         check_linker_flag(C -Wl,--wrap=parse_line LD_SUPPORTS_WRAP)
     endif()
 
-    if (${LD_SUPPORTS_WRAP})
+    # Clang-cl (which is also MSVC) is wrongly detected to support wrap
+    if (NOT MSVC AND "${LD_SUPPORTS_WRAP}")
         list(APPEND unit_tests
             "test_argv"
             "test_tls_crypt"
@@ -667,11 +707,11 @@ if (BUILD_TESTING)
     endif ()
 
     foreach (test_name ${unit_tests})
+        cmake_path(SET _UT_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit_tests/openvpn)
         # test_networking needs special environment
         if (NOT ${test_name} STREQUAL "test_networking")
             add_test(${test_name} ${test_name})
             # for compat with autotools make check
-            set(_UT_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit_tests/openvpn)
             set_tests_properties(${test_name} PROPERTIES
                 ENVIRONMENT "srcdir=${_UT_SOURCE_DIR}")
         endif ()
@@ -691,7 +731,7 @@ if (BUILD_TESTING)
 
         # for compat with IDEs like Clion that ignore the tests properties
         # for the environment variable srcdir when running tests as fallback
-        target_compile_definitions(${test_name} PRIVATE "-DUNIT_TEST_SOURCEDIR=\"${CMAKE_SOURCE_DIR}/tests/unit_tests/openvpn\"")
+        target_compile_definitions(${test_name} PRIVATE "UNIT_TEST_SOURCEDIR=\"${_UT_SOURCE_DIR}\"")
 
         if (NOT ${test_name} STREQUAL "test_buffer")
             target_sources(${test_name} PRIVATE
@@ -703,6 +743,7 @@ if (BUILD_TESTING)
 
     target_sources(test_auth_token PRIVATE
         src/openvpn/base64.c
+        src/openvpn/crypto_epoch.c
         src/openvpn/crypto_mbedtls.c
         src/openvpn/crypto_openssl.c
         src/openvpn/crypto.c
@@ -717,6 +758,7 @@ if (BUILD_TESTING)
     target_sources(test_crypto PRIVATE
         src/openvpn/crypto_mbedtls.c
         src/openvpn/crypto_openssl.c
+        src/openvpn/crypto_epoch.c
         src/openvpn/crypto.c
         src/openvpn/otime.c
         src/openvpn/packet_id.c
@@ -730,9 +772,10 @@ if (BUILD_TESTING)
             tests/unit_tests/openvpn/mock_win32_execve.c
             src/openvpn/argv.c
             src/openvpn/base64.c
-            src/openvpn/crypto.c
+            src/openvpn/crypto_epoch.c
             src/openvpn/crypto_mbedtls.c
             src/openvpn/crypto_openssl.c
+            src/openvpn/crypto.c
             src/openvpn/cryptoapi.c
             src/openvpn/env_set.c
             src/openvpn/mss.c
@@ -758,6 +801,7 @@ if (BUILD_TESTING)
         )
 
     target_sources(test_ncp PRIVATE
+        src/openvpn/crypto_epoch.c
         src/openvpn/crypto_mbedtls.c
         src/openvpn/crypto_openssl.c
         src/openvpn/crypto.c
@@ -779,6 +823,7 @@ if (BUILD_TESTING)
         tests/unit_tests/openvpn/mock_win32_execve.c
         src/openvpn/argv.c
         src/openvpn/base64.c
+        src/openvpn/crypto_epoch.c
         src/openvpn/crypto_mbedtls.c
         src/openvpn/crypto_openssl.c
         src/openvpn/crypto.c
@@ -832,9 +877,11 @@ if (BUILD_TESTING)
         target_compile_options(test_networking PRIVATE -UNDEBUG)
         target_sources(test_networking PRIVATE
             src/openvpn/networking_sitnl.c
+            src/openvpn/crypto_epoch.c
             src/openvpn/crypto_mbedtls.c
             src/openvpn/crypto_openssl.c
             src/openvpn/crypto.c
+            src/openvpn/crypto_epoch.c
             src/openvpn/otime.c
             src/openvpn/packet_id.c
             )
@@ -850,6 +897,7 @@ if (BUILD_TESTING)
             tests/unit_tests/openvpn/mock_win32_execve.c
             src/openvpn/argv.c
             src/openvpn/base64.c
+            src/openvpn/crypto_epoch.c
             src/openvpn/crypto_mbedtls.c
             src/openvpn/crypto_openssl.c
             src/openvpn/crypto.c

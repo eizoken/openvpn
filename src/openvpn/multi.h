@@ -22,7 +22,8 @@
  */
 
 /**
- * @file Header file for server-mode related structures and functions.
+ * @file
+ * Header file for server-mode related structures and functions.
  */
 
 #ifndef MULTI_H
@@ -37,6 +38,7 @@
 #include "pool.h"
 #include "mudp.h"
 #include "mtcp.h"
+#include "multi_io.h"
 #include "perf.h"
 #include "vlan.h"
 #include "reflect_filter.h"
@@ -173,8 +175,7 @@ struct multi_context {
     struct mbuf_set *mbuf;      /**< Set of buffers for passing data
                                  *   channel packets between VPN tunnel
                                  *   instances. */
-    struct multi_tcp *mtcp;     /**< State specific to OpenVPN using TCP
-                                 *   as external transport. */
+    struct multi_io *multi_io;     /**< I/O state and events tracker */
     struct ifconfig_pool *ifconfig_pool;
     struct frequency_limit *new_connection_limiter;
     struct initial_packet_rate_limit *initial_rate_limiter;
@@ -203,6 +204,7 @@ struct multi_context {
 
     struct buffer hmac_reply;
     struct link_socket_actual *hmac_reply_dest;
+    struct link_socket *hmac_reply_ls;
 
     /*
      * Timer object for stale route check
@@ -250,11 +252,6 @@ struct multi_route
  * Main event loop for OpenVPN in server mode.
  * @ingroup eventloop
  *
- * This function calls the appropriate main event loop function depending
- * on the transport protocol used:
- *  - \c tunnel_server_udp()
- *  - \c tunnel_server_tcp()
- *
  * @param top          - Top-level context structure.
  */
 void tunnel_server(struct context *top);
@@ -266,7 +263,7 @@ const char *multi_instance_string(const struct multi_instance *mi, bool null, st
  * Called by mtcp.c, mudp.c, or other (to be written) protocol drivers
  */
 
-void multi_init(struct multi_context *m, struct context *t, bool tcp_mode);
+void multi_init(struct multi_context *m, struct context *t);
 
 void multi_uninit(struct multi_context *m);
 
@@ -274,7 +271,8 @@ void multi_top_init(struct multi_context *m, struct context *top);
 
 void multi_top_free(struct multi_context *m);
 
-struct multi_instance *multi_create_instance(struct multi_context *m, const struct mroute_addr *real);
+struct multi_instance *multi_create_instance(struct multi_context *m, const struct mroute_addr *real,
+                                             struct link_socket *sock);
 
 void multi_close_instance(struct multi_context *m, struct multi_instance *mi, bool shutdown);
 
@@ -288,7 +286,8 @@ bool multi_process_timeout(struct multi_context *m, const unsigned int mpp_flags
  * existing peer. Updates multi_instance with new address,
  * updates hashtables in multi_context.
  */
-void multi_process_float(struct multi_context *m, struct multi_instance *mi);
+void multi_process_float(struct multi_context *m, struct multi_instance *mi,
+                         struct link_socket *sock);
 
 #define MPP_PRE_SELECT             (1<<0)
 #define MPP_CONDITIONAL_PRE_SELECT (1<<1)
@@ -353,8 +352,10 @@ bool multi_process_incoming_dco(struct multi_context *m);
  *                       when using TCP transport. Otherwise NULL, as is
  *                       the case when using UDP transport.
  * @param mpp_flags    - Fast I/O optimization flags.
+ * @param sock         - Socket where the packet was received.
  */
-bool multi_process_incoming_link(struct multi_context *m, struct multi_instance *instance, const unsigned int mpp_flags);
+bool multi_process_incoming_link(struct multi_context *m, struct multi_instance *instance, const unsigned int mpp_flags,
+                                 struct link_socket *sock);
 
 
 /**
@@ -668,7 +669,7 @@ multi_process_outgoing_tun(struct multi_context *m, const unsigned int mpp_flags
 #endif
     set_prefix(mi);
     vlan_process_outgoing_tun(m, mi);
-    process_outgoing_tun(&mi->context);
+    process_outgoing_tun(&mi->context, mi->context.c2.link_sockets[0]);
     ret = multi_process_post(m, mi, mpp_flags);
     clear_prefix();
     return ret;
@@ -683,7 +684,7 @@ multi_process_outgoing_link_dowork(struct multi_context *m, struct multi_instanc
 {
     bool ret = true;
     set_prefix(mi);
-    process_outgoing_link(&mi->context, mi->context.c2.link_socket);
+    process_outgoing_link(&mi->context, mi->context.c2.link_sockets[0]);
     ret = multi_process_post(m, mi, mpp_flags);
     clear_prefix();
     return ret;

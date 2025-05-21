@@ -155,6 +155,8 @@ struct route_gateway_info {
     /* gateway interface */
 #ifdef _WIN32
     DWORD adapter_index; /* interface or ~0 if undefined */
+#elif defined(TARGET_HAIKU)
+    char iface[PATH_MAX]; /* iface names are full /dev path with driver name */
 #else
     char iface[16]; /* interface name (null terminated), may be empty */
 #endif
@@ -186,7 +188,12 @@ struct route_ipv6_gateway_info {
 #else
     /* non linux platform don't have this constant defined */
 #ifndef IFNAMSIZ
+#if defined(TARGET_HAIKU)
+/* iface names are full /dev path with driver name */
+#define IFNAMSIZ PATH_MAX
+#else
 #define IFNAMSIZ 16
+#endif
 #endif
     char iface[IFNAMSIZ]; /* interface name (null terminated), may be empty */
 #endif
@@ -273,7 +280,7 @@ void route_ipv6_clear_host_bits( struct route_ipv6 *r6 );
 
 bool add_route_ipv6(struct route_ipv6 *r, const struct tuntap *tt, unsigned int flags, const struct env_set *es, openvpn_net_ctx_t *ctx);
 
-void delete_route_ipv6(const struct route_ipv6 *r, const struct tuntap *tt, unsigned int flags, const struct env_set *es, openvpn_net_ctx_t *ctx);
+void delete_route_ipv6(const struct route_ipv6 *r, const struct tuntap *tt, const struct env_set *es, openvpn_net_ctx_t *ctx);
 
 bool add_route(struct route_ipv4 *r, const struct tuntap *tt, unsigned int flags,
                const struct route_gateway_info *rgi, const struct env_set *es,
@@ -327,7 +334,15 @@ void setenv_routes_ipv6(struct env_set *es, const struct route_ipv6_list *rl6);
 
 bool is_special_addr(const char *addr_str);
 
+/**
+ * @brief Retrieves the best gateway for a given destination based on the routing table.
+ *
+ * @param rgi  Pointer to a struct to store the gateway information.
+ * @param dest Destination IP address in host byte order.
+ * @param ctx  Pointer to a platform-specific network context struct.
+ */
 void get_default_gateway(struct route_gateway_info *rgi,
+                         in_addr_t dest,
                          openvpn_net_ctx_t *ctx);
 
 void get_default_gateway_ipv6(struct route_ipv6_gateway_info *rgi,

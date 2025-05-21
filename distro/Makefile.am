@@ -13,3 +13,7 @@ MAINTAINERCLEANFILES = \
 	$(srcdir)/Makefile.in
 
 SUBDIRS = systemd
+
+if ENABLE_DNS_UPDOWN
+SUBDIRS += dns-scripts
+endif

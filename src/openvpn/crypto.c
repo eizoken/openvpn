@@ -32,6 +32,8 @@
 #include <string.h>
 
 #include "crypto.h"
+#include "crypto_epoch.h"
+#include "packet_id.h"
 #include "error.h"
 #include "integer.h"
 #include "platform.h"
@@ -67,6 +69,13 @@ openvpn_encrypt_aead(struct buffer *buf, struct buffer work,
 {
     struct gc_arena gc;
     int outlen = 0;
+    const bool use_epoch_data_format = opt->flags & CO_EPOCH_DATA_KEY_FORMAT;
+
+    if (use_epoch_data_format)
+    {
+        epoch_check_send_iterate(opt);
+    }
+
     const struct key_ctx *ctx = &opt->key_ctx_bi.encrypt;
     uint8_t *mac_out = NULL;
     const int mac_len = OPENVPN_AEAD_TAG_LENGTH;
@@ -88,18 +97,32 @@ openvpn_encrypt_aead(struct buffer *buf, struct buffer work,
         buf_set_write(&iv_buffer, iv, iv_len);
 
         /* IV starts with packet id to make the IV unique for packet */
-        if (!packet_id_write(&opt->packet_id.send, &iv_buffer, false, false))
+        if (use_epoch_data_format)
         {
-            msg(D_CRYPT_ERRORS, "ENCRYPT ERROR: packet ID roll over");
-            goto err;
+            if (!packet_id_write_epoch(&opt->packet_id.send, ctx->epoch, &iv_buffer))
+            {
+                msg(D_CRYPT_ERRORS, "ENCRYPT ERROR: packet ID roll over");
+                goto err;
+            }
+        }
+        else
+        {
+            if (!packet_id_write(&opt->packet_id.send, &iv_buffer, false, false))
+            {
+                msg(D_CRYPT_ERRORS, "ENCRYPT ERROR: packet ID roll over");
+                goto err;
+            }
+        }
+        /* Write packet id part of IV to work buffer */
+        ASSERT(buf_write(&work, iv, buf_len(&iv_buffer)));
+
+        /* This generates the IV by XORing the implicit part of the IV
+         * with the packet id already written to the iv buffer */
+        for (int i = 0; i < iv_len; i++)
+        {
+            iv[i] = iv[i] ^ ctx->implicit_iv[i];
         }
 
-        /* Remainder of IV consists of implicit part (unique per session) */
-        ASSERT(buf_write(&iv_buffer, ctx->implicit_iv, ctx->implicit_iv_len));
-        ASSERT(iv_buffer.len == iv_len);
-
-        /* Write explicit part of IV to work buffer */
-        ASSERT(buf_write(&work, iv, iv_len - ctx->implicit_iv_len));
         dmsg(D_PACKET_CONTENT, "ENCRYPT IV: %s", format_hex(iv, iv_len, 0, &gc));
 
         /* Init cipher_ctx with IV.  key & keylen are already initialized */
@@ -123,7 +146,7 @@ openvpn_encrypt_aead(struct buffer *buf, struct buffer work,
     dmsg(D_PACKET_CONTENT, "ENCRYPT AD: %s",
          format_hex(BPTR(&work), BLEN(&work), 0, &gc));
 
-    if (!(opt->flags & CO_AEAD_TAG_AT_THE_END))
+    if (!use_epoch_data_format)
     {
         /* Reserve space for authentication tag */
         mac_out = buf_write_alloc(&work, mac_len);
@@ -134,12 +157,17 @@ openvpn_encrypt_aead(struct buffer *buf, struct buffer work,
     ASSERT(cipher_ctx_update(ctx->cipher, BEND(&work), &outlen, BPTR(buf), BLEN(buf)));
     ASSERT(buf_inc_len(&work, outlen));
 
+    /* update number of plaintext blocks encrypted. Use the (x + (n-1))/n trick
+     * to round up the result to the number of blocks used */
+    const int blocksize = AEAD_LIMIT_BLOCKSIZE;
+    opt->key_ctx_bi.encrypt.plaintext_blocks += (outlen + (blocksize - 1))/blocksize;
+
     /* Flush the encryption buffer */
     ASSERT(cipher_ctx_final(ctx->cipher, BEND(&work), &outlen));
     ASSERT(buf_inc_len(&work, outlen));
 
     /* if the tag is at end the end, allocate it now */
-    if (opt->flags & CO_AEAD_TAG_AT_THE_END)
+    if (use_epoch_data_format)
     {
         /* Reserve space for authentication tag */
         mac_out = buf_write_alloc(&work, mac_len);
@@ -321,16 +349,68 @@ openvpn_encrypt(struct buffer *buf, struct buffer work,
     }
 }
 
+uint64_t
+cipher_get_aead_limits(const char *ciphername)
+{
+    if (!cipher_kt_mode_aead(ciphername))
+    {
+        return 0;
+    }
+
+    if (cipher_kt_name(ciphername) == cipher_kt_name("CHACHA20-POLY1305"))
+    {
+        return 0;
+    }
+
+    /* Assume all other ciphers require the limit */
+
+    /* We focus here on the equation
+     *
+     *       q + s <= p^(1/2) * 2^(129/2) - 1
+     *
+     * as is the one that is limiting us.
+     *
+     *  With p = 2^-57 this becomes
+     *
+     *      q + s <= (2^36 - 1)
+     *
+     */
+    uint64_t rs = (1ull << 36) - 1;
+
+    return rs;
+}
+
 bool
 crypto_check_replay(struct crypto_options *opt,
-                    const struct packet_id_net *pin, const char *error_prefix,
+                    const struct packet_id_net *pin, uint16_t epoch,
+                    const char *error_prefix,
                     struct gc_arena *gc)
 {
     bool ret = false;
-    packet_id_reap_test(&opt->packet_id.rec);
-    if (packet_id_test(&opt->packet_id.rec, pin))
+    struct packet_id_rec *recv;
+
+    if (epoch == 0 || opt->key_ctx_bi.decrypt.epoch == epoch)
     {
-        packet_id_add(&opt->packet_id.rec, pin);
+        recv = &opt->packet_id.rec;
+    }
+    else if (epoch == opt->epoch_retiring_data_receive_key.epoch)
+    {
+        recv = &opt->epoch_retiring_key_pid_recv;
+    }
+    else
+    {
+        /* We have an epoch that is neither current or old recv key but
+         * is authenticated, ie we need to move to a new current recv key */
+        msg(D_GENKEY, "Received data packet with new epoch %d. Updating "
+            "receive key", epoch);
+        epoch_replace_update_recv_key(opt, epoch);
+        recv = &opt->packet_id.rec;
+    }
+
+    packet_id_reap_test(recv);
+    if (packet_id_test(recv, pin))
+    {
+        packet_id_add(recv, pin);
         if (opt->pid_persist && (opt->flags & CO_PACKET_ID_LONG_FORM))
         {
             packet_id_persist_save_obj(opt->pid_persist, &opt->packet_id);
@@ -365,11 +445,18 @@ openvpn_decrypt_aead(struct buffer *buf, struct buffer work,
 {
     static const char error_prefix[] = "AEAD Decrypt error";
     struct packet_id_net pin = { 0 };
-    const struct key_ctx *ctx = &opt->key_ctx_bi.decrypt;
-    int outlen;
     struct gc_arena gc;
-
     gc_init(&gc);
+
+    struct key_ctx *ctx = &opt->key_ctx_bi.decrypt;
+    const bool use_epoch_data_format = opt->flags & CO_EPOCH_DATA_KEY_FORMAT;
+    if (!use_epoch_data_format && cipher_decrypt_verify_fail_exceeded(ctx))
+    {
+        CRYPT_DROP("Decryption failed verification limit reached.");
+    }
+
+    const int tag_size = OPENVPN_AEAD_TAG_LENGTH;
+
 
     ASSERT(opt);
     ASSERT(frame);
@@ -386,20 +473,67 @@ openvpn_decrypt_aead(struct buffer *buf, struct buffer work,
     /* IV and Packet ID required for this mode */
     ASSERT(packet_id_initialized(&opt->packet_id));
 
+    /* Ensure that the packet size is long enough */
+    int min_packet_len = packet_id_size(false) + tag_size + 1;
+
+    if (use_epoch_data_format)
+    {
+        min_packet_len += sizeof(uint32_t);
+    }
+
+    if (buf->len < min_packet_len)
+    {
+        CRYPT_ERROR("missing IV info, missing tag or no payload");
+    }
+
+    uint16_t epoch = 0;
     /* Combine IV from explicit part from packet and implicit part from context */
     {
         uint8_t iv[OPENVPN_MAX_IV_LENGTH] = { 0 };
         const int iv_len = cipher_ctx_iv_length(ctx->cipher);
-        const size_t packet_iv_len = iv_len - ctx->implicit_iv_len;
 
-        ASSERT(ctx->implicit_iv_len <= iv_len);
-        if (buf->len + ctx->implicit_iv_len < iv_len)
+        /* Read packet id. For epoch data format also lookup the epoch key
+         * to be able to use the implicit IV of the correct decryption key */
+        if (use_epoch_data_format)
         {
-            CRYPT_ERROR("missing IV info");
+            /* packet ID format is 16 bit epoch + 48 per epoch packet-counter */
+            const size_t packet_iv_len = sizeof(uint64_t);
+
+            /* copy the epoch-counter part into the IV */
+            memcpy(iv, BPTR(buf), packet_iv_len);
+
+            epoch = packet_id_read_epoch(&pin, buf);
+            if (epoch == 0)
+            {
+                CRYPT_ERROR("error reading packet-id");
+            }
+            ctx = epoch_lookup_decrypt_key(opt, epoch);
+            if (!ctx)
+            {
+                CRYPT_ERROR("data packet with unknown epoch");
+            }
+            else if (cipher_decrypt_verify_fail_exceeded(ctx))
+            {
+                CRYPT_DROP("Decryption failed verification limit reached");
+            }
+        }
+        else
+        {
+            const size_t packet_iv_len = packet_id_size(false);
+            /* Packet ID form is a 32 bit packet counter */
+            memcpy(iv, BPTR(buf), packet_iv_len);
+            if (!packet_id_read(&pin, buf, false))
+            {
+                CRYPT_ERROR("error reading packet-id");
+            }
         }
 
-        memcpy(iv, BPTR(buf), packet_iv_len);
-        memcpy(iv + packet_iv_len, ctx->implicit_iv, ctx->implicit_iv_len);
+        /* This generates the IV by XORing the implicit part of the IV
+         * with the packet id already written to the iv buffer */
+        for (int i = 0; i < iv_len; i++)
+        {
+            iv[i] = iv[i] ^ ctx->implicit_iv[i];
+        }
 
         dmsg(D_PACKET_CONTENT, "DECRYPT IV: %s", format_hex(iv, iv_len, 0, &gc));
 
@@ -410,25 +544,12 @@ openvpn_decrypt_aead(struct buffer *buf, struct buffer work,
         }
     }
 
-    /* Read packet ID from packet */
-    if (!packet_id_read(&pin, buf, false))
-    {
-        CRYPT_ERROR("error reading packet-id");
-    }
-
-    /* keep the tag value to feed in later */
-    const int tag_size = OPENVPN_AEAD_TAG_LENGTH;
-    if (buf->len < tag_size + 1)
-    {
-        CRYPT_ERROR("missing tag or no payload");
-    }
-
     const int ad_size = BPTR(buf) - ad_start;
 
     uint8_t *tag_ptr = NULL;
     int data_len = 0;
 
-    if (opt->flags & CO_AEAD_TAG_AT_THE_END)
+    if (use_epoch_data_format)
     {
         data_len = BLEN(buf) - tag_size;
         tag_ptr = BPTR(buf) + data_len;
@@ -449,13 +570,13 @@ openvpn_decrypt_aead(struct buffer *buf, struct buffer work,
         CRYPT_ERROR("potential buffer overflow");
     }
 
-
     /* feed in tag and the authenticated data */
     ASSERT(cipher_ctx_update_ad(ctx->cipher, ad_start, ad_size));
     dmsg(D_PACKET_CONTENT, "DECRYPT AD: %s",
          format_hex(ad_start, ad_size, 0, &gc));
 
     /* Decrypt and authenticate packet */
+    int outlen;
     if (!cipher_ctx_update(ctx->cipher, BPTR(&work), &outlen, BPTR(buf),
                            data_len))
     {
@@ -466,6 +587,7 @@ openvpn_decrypt_aead(struct buffer *buf, struct buffer work,
     if (!cipher_ctx_final_check_tag(ctx->cipher, BPTR(&work) + outlen,
                                     &outlen, tag_ptr, tag_size))
     {
+        ctx->failed_verifications++;
         CRYPT_DROP("packet tag authentication failed");
     }
     ASSERT(buf_inc_len(&work, outlen));
@@ -473,10 +595,16 @@ openvpn_decrypt_aead(struct buffer *buf, struct buffer work,
     dmsg(D_PACKET_CONTENT, "DECRYPT TO: %s",
          format_hex(BPTR(&work), BLEN(&work), 80, &gc));
 
-    if (!crypto_check_replay(opt, &pin, error_prefix, &gc))
+    if (!crypto_check_replay(opt, &pin, epoch, error_prefix, &gc))
     {
         goto error_exit;
     }
+
+
+    /* update number of plaintext blocks decrypted. Use the (x + (n-1))/n trick
+     * to round up the result to the number of blocks used. */
+    const int blocksize = AEAD_LIMIT_BLOCKSIZE;
+    opt->key_ctx_bi.decrypt.plaintext_blocks += (outlen + (blocksize - 1))/blocksize;
 
     *buf = work;
 
@@ -644,7 +772,7 @@ openvpn_decrypt_v1(struct buffer *buf, struct buffer work,
             }
         }
 
-        if (have_pin && !crypto_check_replay(opt, &pin, error_prefix, &gc))
+        if (have_pin && !crypto_check_replay(opt, &pin, 0, error_prefix, &gc))
         {
             goto error_exit;
         }
@@ -840,9 +968,51 @@ init_key_type(struct key_type *kt, const char *ciphername,
     }
 }
 
+/**
+ * Update the implicit IV for a key_ctx based on TLS session ids and cipher
+ * used.
+ *
+ * Note that the implicit IV is based on the HMAC key of the \c key parameter,
+ * but only in AEAD modes where the HMAC key is not used for an actual HMAC.
+ *
+ * @param ctx                   Encrypt/decrypt key context
+ * @param key                   key parameters holding the key and hmac/
+ *                              implicit iv used to calculate implicit IV
+ */
+static void
+key_ctx_update_implicit_iv(struct key_ctx *ctx, const struct key_parameters *key)
+{
+    /* Only use implicit IV in AEAD cipher mode, where HMAC key is not used */
+    if (cipher_ctx_mode_aead(ctx->cipher))
+    {
+        size_t impl_iv_len = 0;
+        size_t impl_iv_offset = 0;
+        ASSERT(cipher_ctx_iv_length(ctx->cipher) >= OPENVPN_AEAD_MIN_IV_LEN);
+
+        /* Epoch keys use XOR of full IV length with the packet id to generate
+         * IVs. Old data format uses concatenation instead (XOR with 0 for the
+         * first 4 bytes (sizeof(packet_id_type) */
+        if (key->epoch)
+        {
+            impl_iv_len = cipher_ctx_iv_length(ctx->cipher);
+            impl_iv_offset = 0;
+        }
+        else
+        {
+            impl_iv_len = cipher_ctx_iv_length(ctx->cipher) - sizeof(packet_id_type);
+            impl_iv_offset = sizeof(packet_id_type);
+        }
+        ASSERT(impl_iv_offset + impl_iv_len <= OPENVPN_MAX_IV_LENGTH);
+        ASSERT(impl_iv_len <= MAX_HMAC_KEY_LENGTH);
+        ASSERT(impl_iv_len <= key->hmac_size);
+        CLEAR(ctx->implicit_iv);
+        memcpy(ctx->implicit_iv + impl_iv_offset, key->hmac, impl_iv_len);
+    }
+}
+
 /* given a key and key_type, build a key_ctx */
 void
-init_key_ctx(struct key_ctx *ctx, const struct key *key,
+init_key_ctx(struct key_ctx *ctx, const struct key_parameters *key,
              const struct key_type *kt, int enc,
              const char *prefix)
 {
@@ -850,7 +1020,7 @@ init_key_ctx(struct key_ctx *ctx, const struct key *key,
     CLEAR(*ctx);
     if (cipher_defined(kt->cipher))
     {
-
+        ASSERT(key->cipher_size >= cipher_kt_key_size(kt->cipher));
         ctx->cipher = cipher_ctx_new();
         cipher_ctx_init(ctx->cipher, key->cipher, kt->cipher, enc);
 
@@ -865,8 +1035,10 @@ init_key_ctx(struct key_ctx *ctx, const struct key *key,
              cipher_kt_iv_size(kt->cipher));
         warn_insecure_key_type(ciphername);
     }
+
     if (md_defined(kt->digest))
     {
+        ASSERT(key->hmac_size >= md_kt_size(kt->digest));
         ctx->hmac = hmac_ctx_new();
         hmac_ctx_init(ctx->hmac, key->hmac, kt->digest);
 
@@ -883,26 +1055,50 @@ init_key_ctx(struct key_ctx *ctx, const struct key *key,
              hmac_ctx_size(ctx->hmac));
 
     }
+    ctx->epoch = key->epoch;
     gc_free(&gc);
+}
+
+void
+init_key_bi_ctx_send(struct key_ctx *ctx, const struct key_parameters *key_params,
+                     const struct key_type *kt, const char *name)
+{
+    char log_prefix[128] = { 0 };
+
+    snprintf(log_prefix, sizeof(log_prefix), "Outgoing %s", name);
+    init_key_ctx(ctx, key_params, kt, OPENVPN_OP_ENCRYPT, log_prefix);
+    key_ctx_update_implicit_iv(ctx, key_params);
+    ctx->epoch = key_params->epoch;
+}
+
+void
+init_key_bi_ctx_recv(struct key_ctx *ctx, const struct key_parameters *key_params,
+                     const struct key_type *kt, const char *name)
+{
+    char log_prefix[128] = { 0 };
+
+    snprintf(log_prefix, sizeof(log_prefix), "Incoming %s", name);
+    init_key_ctx(ctx, key_params, kt, OPENVPN_OP_DECRYPT, log_prefix);
+    key_ctx_update_implicit_iv(ctx, key_params);
+    ctx->epoch = key_params->epoch;
 }
 
 void
 init_key_ctx_bi(struct key_ctx_bi *ctx, const struct key2 *key2,
                 int key_direction, const struct key_type *kt, const char *name)
 {
-    char log_prefix[128] = { 0 };
     struct key_direction_state kds;
 
     key_direction_state_init(&kds, key_direction);
 
-    snprintf(log_prefix, sizeof(log_prefix), "Outgoing %s", name);
-    init_key_ctx(&ctx->encrypt, &key2->keys[kds.out_key], kt,
-                 OPENVPN_OP_ENCRYPT, log_prefix);
+    struct key_parameters send_key;
+    struct key_parameters recv_key;
 
-    snprintf(log_prefix, sizeof(log_prefix), "Incoming %s", name);
-    init_key_ctx(&ctx->decrypt, &key2->keys[kds.in_key], kt,
-                 OPENVPN_OP_DECRYPT, log_prefix);
+    key_parameters_from_key(&send_key, &key2->keys[kds.out_key]);
+    key_parameters_from_key(&recv_key, &key2->keys[kds.in_key]);
 
+    init_key_bi_ctx_send(&ctx->encrypt, &send_key, kt, name);
+    init_key_bi_ctx_recv(&ctx->decrypt, &recv_key, kt, name);
     ctx->initialized = true;
 }
 
@@ -920,7 +1116,9 @@ free_key_ctx(struct key_ctx *ctx)
         hmac_ctx_free(ctx->hmac);
         ctx->hmac = NULL;
     }
-    ctx->implicit_iv_len = 0;
+    CLEAR(ctx->implicit_iv);
+    ctx->plaintext_blocks = 0;
+    ctx->epoch = 0;
 }
 
 void
@@ -928,6 +1126,7 @@ free_key_ctx_bi(struct key_ctx_bi *ctx)
 {
     free_key_ctx(&ctx->encrypt);
     free_key_ctx(&ctx->decrypt);
+    ctx->initialized = false;
 }
 
 static bool
@@ -1017,6 +1216,16 @@ key2_print(const struct key2 *k,
 }
 
 void
+key_parameters_from_key(struct key_parameters *key_params, const struct key *key)
+{
+    CLEAR(*key_params);
+    memcpy(key_params->cipher, key->cipher, MAX_CIPHER_KEY_LENGTH);
+    key_params->cipher_size = MAX_CIPHER_KEY_LENGTH;
+    memcpy(key_params->hmac, key->hmac, MAX_HMAC_KEY_LENGTH);
+    key_params->hmac_size = MAX_HMAC_KEY_LENGTH;
+}
+
+void
 test_crypto(struct crypto_options *co, struct frame *frame)
 {
     int i, j;
@@ -1036,18 +1245,15 @@ test_crypto(struct crypto_options *co, struct frame *frame)
         cipher_ctx_t *cipher = co->key_ctx_bi.encrypt.cipher;
         if (cipher_ctx_mode_aead(cipher))
         {
-            size_t impl_iv_len = cipher_ctx_iv_length(cipher) - sizeof(packet_id_type);
             ASSERT(cipher_ctx_iv_length(cipher) <= OPENVPN_MAX_IV_LENGTH);
             ASSERT(cipher_ctx_iv_length(cipher) >= OPENVPN_AEAD_MIN_IV_LEN);
 
             /* Generate dummy implicit IV */
             ASSERT(rand_bytes(co->key_ctx_bi.encrypt.implicit_iv,
                               OPENVPN_MAX_IV_LENGTH));
-            co->key_ctx_bi.encrypt.implicit_iv_len = impl_iv_len;
 
             memcpy(co->key_ctx_bi.decrypt.implicit_iv,
                    co->key_ctx_bi.encrypt.implicit_iv, OPENVPN_MAX_IV_LENGTH);
-            co->key_ctx_bi.decrypt.implicit_iv_len = impl_iv_len;
         }
     }
 

@@ -30,7 +30,8 @@ AM_CFLAGS = \
 	$(OPTIONAL_LZ4_CFLAGS) \
 	$(OPTIONAL_PKCS11_HELPER_CFLAGS) \
 	$(OPTIONAL_INOTIFY_CFLAGS) \
-	-DPLUGIN_LIBDIR=\"${plugindir}\"
+	-DPLUGIN_LIBDIR=\"${plugindir}\" \
+	-DDEFAULT_DNS_UPDOWN=\"${scriptdir}/dns-updown\"
 
 if WIN32
 # we want unicode entry point but not the macro
@@ -53,6 +54,7 @@ openvpn_SOURCES = \
 	crypto.c crypto.h crypto_backend.h \
 	crypto_openssl.c crypto_openssl.h \
 	crypto_mbedtls.c crypto_mbedtls.h \
+	crypto_epoch.c crypto_epoch.h \
 	dco.c dco.h dco_internal.h \
 	dco_freebsd.c dco_freebsd.h \
 	dco_linux.c dco_linux.h \
@@ -92,6 +94,7 @@ openvpn_SOURCES = \
 	mtu.c mtu.h \
 	mudp.c mudp.h \
 	multi.c multi.h \
+	multi_io.c multi_io.h \
 	networking_freebsd.c \
 	networking_iproute2.c networking_iproute2.h \
 	networking_sitnl.c networking_sitnl.h \
@@ -161,6 +164,6 @@ openvpn_LDADD = \
 	$(OPTIONAL_DL_LIBS) \
 	$(OPTIONAL_INOTIFY_LIBS)
 if WIN32
-openvpn_SOURCES += openvpn_win32_resources.rc wfp_block.c wfp_block.h ring_buffer.h
+openvpn_SOURCES += openvpn_win32_resources.rc wfp_block.c wfp_block.h
 openvpn_LDADD += -lgdi32 -lws2_32 -lwininet -lcrypt32 -liphlpapi -lwinmm -lfwpuclnt -lrpcrt4 -lncrypt -lsetupapi -lbcrypt
 endif

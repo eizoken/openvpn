@@ -544,45 +544,52 @@ man_kill(struct management *man, const char *victim)
         struct buffer buf;
         char p1[128];
         char p2[128];
+        char p3[128];
         int n_killed;
 
         buf_set_read(&buf, (uint8_t *) victim, strlen(victim) + 1);
         buf_parse(&buf, ':', p1, sizeof(p1));
         buf_parse(&buf, ':', p2, sizeof(p2));
+        buf_parse(&buf, ':', p3, sizeof(p3));
 
-        if (strlen(p1) && strlen(p2))
+        if (strlen(p1) && strlen(p2) && strlen(p3))
         {
             /* IP:port specified */
             bool status;
-            const in_addr_t addr = getaddr(GETADDR_HOST_ORDER|GETADDR_MSG_VIRT_OUT, p1, 0, &status, NULL);
+            const in_addr_t addr = getaddr(GETADDR_HOST_ORDER|GETADDR_MSG_VIRT_OUT, p2, 0, &status, NULL);
             if (status)
             {
-                const int port = atoi(p2);
-                if (port > 0 && port < 65536)
+                const int port = atoi(p3);
+                const int proto = (streq(p1, "tcp")) ? PROTO_TCP_SERVER :
+                                  (streq(p1, "udp")) ? PROTO_UDP : PROTO_NONE;
+
+                if ((port > 0 && port < 65536) && (proto != PROTO_NONE))
                 {
-                    n_killed = (*man->persist.callback.kill_by_addr)(man->persist.callback.arg, addr, port);
+                    n_killed = (*man->persist.callback.kill_by_addr)(man->persist.callback.arg, addr, port, proto);
                     if (n_killed > 0)
                     {
-                        msg(M_CLIENT, "SUCCESS: %d client(s) at address %s:%d killed",
+                        msg(M_CLIENT, "SUCCESS: %d client(s) at address %s:%s:%d killed",
                             n_killed,
+                            proto2ascii(proto, AF_UNSPEC, false),
                             print_in_addr_t(addr, 0, &gc),
                             port);
                     }
                     else
                     {
-                        msg(M_CLIENT, "ERROR: client at address %s:%d not found",
+                        msg(M_CLIENT, "ERROR: client at address %s:%s:%d not found",
+                            proto2ascii(proto, AF_UNSPEC, false),
                             print_in_addr_t(addr, 0, &gc),
                             port);
                     }
                 }
                 else
                 {
-                    msg(M_CLIENT, "ERROR: port number is out of range: %s", p2);
+                    msg(M_CLIENT, "ERROR: port number or protocol out of range: %s %s", p3, p1);
                 }
             }
             else
             {
-                msg(M_CLIENT, "ERROR: error parsing IP address: %s", p1);
+                msg(M_CLIENT, "ERROR: error parsing IP address: %s", p2);
             }
         }
         else if (strlen(p1))
@@ -1052,8 +1059,9 @@ parse_uint(const char *str, const char *what, unsigned int *uint)
  * @param man           The management interface struct
  * @param cid_str       The CID in string form
  * @param kid_str       The key ID in string form
- * @param extra         The string to be send to the client containing
+ * @param extra         The string to be sent to the client containing
  *                      the information of the additional steps
+ * @param timeout_str   The timeout value in string form
  */
 static void
 man_client_pending_auth(struct management *man, const char *cid_str,
@@ -1240,6 +1248,7 @@ man_load_stats(struct management *man)
  * Checks if the correct number of arguments to a management command are present
  * and otherwise prints an error and returns false.
  *
+ * @param man       The management interface struct
  * @param p         pointer to the parameter array
  * @param n         number of arguments required
  * @param flags     if MN_AT_LEAST require at least n parameters and not exactly n
@@ -1822,7 +1831,9 @@ man_accept(struct management *man)
     }
     else
 #endif
-    man->connection.sd_cli = socket_do_accept(man->connection.sd_top, &act, false);
+    {
+        man->connection.sd_cli = socket_do_accept(man->connection.sd_top, &act, false);
+    }
 
     if (socket_defined(man->connection.sd_cli))
     {
@@ -1971,9 +1982,11 @@ man_connect(struct management *man)
         }
         else
 #endif
-        msg(D_LINK_ERRORS | M_ERRNO,
-            "MANAGEMENT: connect to %s failed",
-            print_sockaddr(man->settings.local->ai_addr, &gc));
+        {
+            msg(D_LINK_ERRORS | M_ERRNO,
+                "MANAGEMENT: connect to %s failed",
+                print_sockaddr(man->settings.local->ai_addr, &gc));
+        }
         throw_signal_soft(SIGTERM, "management-connect-failed");
         goto done;
     }
@@ -3435,7 +3448,8 @@ management_event_loop_n_seconds(struct management *man, int sec)
         const bool standalone_disabled_save = man->persist.standalone_disabled;
         time_t expire = 0;
 
-        man->persist.standalone_disabled = false; /* This is so M_CLIENT messages will be correctly passed through msg() */
+        /* This is so M_CLIENT messages will be correctly passed through msg() */
+        man->persist.standalone_disabled = false;
 
         /* set expire time */
         update_time();
@@ -3498,7 +3512,8 @@ management_query_user_pass(struct management *man,
         unsigned int up_query_mode = 0;
         const char *sc = NULL;
         ret = true;
-        man->persist.standalone_disabled = false; /* This is so M_CLIENT messages will be correctly passed through msg() */
+        /* This is so M_CLIENT messages will be correctly passed through msg() */
+        man->persist.standalone_disabled = false;
         man->persist.special_state_msg = NULL;
 
         CLEAR(man->connection.up_query);
@@ -3622,7 +3637,8 @@ management_query_multiline(struct management *man,
 
     if (man_standalone_ok(man))
     {
-        man->persist.standalone_disabled = false; /* This is so M_CLIENT messages will be correctly passed through msg() */
+        /* This is so M_CLIENT messages will be correctly passed through msg() */
+        man->persist.standalone_disabled = false;
         man->persist.special_state_msg = NULL;
 
         *state = EKS_SOLICIT;
@@ -4134,8 +4150,13 @@ management_check_bytecount(struct context *c, struct management *man, struct tim
         counter_type dco_read_bytes = 0;
         counter_type dco_write_bytes = 0;
 
-        if (dco_enabled(&c->options) && (dco_get_peer_stats(c) == 0))
+        if (dco_enabled(&c->options))
         {
+            if (dco_get_peer_stats(c, true) < 0)
+            {
+                return;
+            }
+
             dco_read_bytes = c->c2.dco_read_bytes;
             dco_write_bytes = c->c2.dco_write_bytes;
         }
@@ -4154,7 +4175,8 @@ management_check_bytecount(struct context *c, struct management *man, struct tim
 void
 man_persist_client_stats(struct management *man, struct context *c)
 {
-    if (dco_enabled(&c->options) && (dco_get_peer_stats(c) == 0))
+    /* no need to raise SIGUSR1 since we are already closing the instance */
+    if (dco_enabled(&c->options) && (dco_get_peer_stats(c, false) == 0))
     {
         management_bytes_client(man, c->c2.dco_read_bytes, c->c2.dco_write_bytes);
     }
